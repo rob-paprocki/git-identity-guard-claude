@@ -109,8 +109,17 @@ actor can also exfiltrate via non-git channels, so the hook is hardening, not a 
 `config.example.json` + thin plugin + GitHub Actions CI + `CONTRIBUTING.md` + a short demo
 (asciinema/gif) + `/identity-lock add|remove|list|status`.
 
-## 9. Deferred (user intends to expand later)
+## 9. Roadmap / future plans
 
-Out of scope for v1, captured for later: richer plugin UX, multi-host/GitHub-Enterprise
-support, optional OS-level isolation guidance, and any additional hardening the user wants
-to pursue.
+The owner intends to grow this beyond v1. The repo surfaces this as a top-level
+`ROADMAP.md` (owner-curated) so parked ideas have a durable home and contributors can see
+direction. Seeded, non-binding candidates (to be expanded later):
+
+- richer plugin UX (status dashboard, per-folder enable/disable, doctor command);
+- multi-host / GitHub Enterprise support (per-host credential helpers, `GH_HOST`);
+- optional OS-level isolation guidance (per-identity user accounts / container-per-folder)
+  to push past the command-hook residual floor;
+- additional guard hardening as new bypass classes surface;
+- a `--dry-run` / audit mode that reports what *would* be wired without changing anything.
+
+v1 build scope is fixed at §8; everything here is explicitly out of v1.
