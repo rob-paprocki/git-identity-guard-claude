@@ -27,12 +27,13 @@ fails closed when a session is not pinned.
 ## How it pins identity: the layers
 
 Identity is pinned by default through scoped, declarative mechanisms — never by
-mutating-and-restoring global state. Each layer works on its own; together they
-are defense-in-depth.
+mutating-and-restoring global state. Four per-folder layers (L1–L4) establish the
+identity; a fifth (L5) is a deny-guard that catches attempts to override them.
+Each layer works on its own; together they are defense-in-depth.
 
 | Layer | Surface | Mechanism |
 |-------|---------|-----------|
-| L1 | commit author/committer | gitconfig `includeIf "gitdir:<folder>/"` + `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env |
+| L1 | commit author/committer | gitconfig `includeIf "gitdir/i:<folder>/"` + `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env |
 | L2 | `gh` CLI | per-folder `GH_TOKEN` env outranks the active `gh` account |
 | L3 | `git push` (HTTPS) | per-folder gitconfig `credential.https://github.com.helper` returning `gh auth token --user <acct>` (overrides the OS keychain) |
 | L4 | GitHub MCP | per-folder `GITHUB_PERSONAL_ACCESS_TOKEN` env + a fail-closed write guard |
