@@ -30,6 +30,22 @@ esac
 EOF
 chmod +x "$TMP/bin/gh"; export PATH="$TMP/bin:$PATH"
 
+# Keychain-hardening seam (Task 6). install.sh invokes "$IDENTITY_OSXKEYCHAIN_CMD
+# erase" when hardening; we point it at a harmless stub that records a marker. This
+# is REQUIRED to keep the test off the real `git credential-osxkeychain`, which
+# operates on the per-user macOS login keychain and is NOT sandboxed by $HOME — a
+# PATH stub would be shadowed by git's exec-path on macOS and could erase the
+# tester's real github.com credential. The default (no-flag) command must remain
+# byte-for-byte `git credential-osxkeychain`; we only override it here for tests.
+KEYCHAIN_MARKER="$TMP/erased.marker"
+cat > "$TMP/bin/fake-keychain" <<EOF
+#!/usr/bin/env bash
+cat >/dev/null              # drain the protocol/host stdin git would send
+printf '%s\n' "erased \$*" >> "$KEYCHAIN_MARKER"
+EOF
+chmod +x "$TMP/bin/fake-keychain"
+export IDENTITY_OSXKEYCHAIN_CMD="$TMP/bin/fake-keychain"
+
 mkdir -p "$TMP/folder-a" "$TMP/folder-b"
 CFG="$TMP/.config/identity-lock/folders.json"
 
@@ -165,5 +181,65 @@ jqf "(d) global PreToolUse guard matcher appears exactly once (idempotent merge)
 [ -f "$TMP/.claude/hooks/lib/resolve-account.sh" ] \
   && { pass=$((pass+1)); echo "  PASS  (e) lib/resolve-account.sh installed"; } \
   || { fail=$((fail+1)); echo "  FAIL  (e) lib/resolve-account.sh missing in ~/.claude/hooks/lib/"; }
+
+# ===========================================================================
+# Task 6: osxkeychain opt-in hardening + uninstall.sh.
+# ===========================================================================
+UNINSTALL="$(cd "$(dirname "$0")/.." && pwd)/uninstall.sh"
+
+# ok/no <name> <cond-exit>: tiny pass/fail recorder driven by the prior command's
+# exit status (call as `cmd; ok NAME $?` or use `[ test ]; ok NAME $?`).
+ok() { local name="$1" rc="$2"
+  if [ "$rc" = 0 ]; then pass=$((pass+1)); printf '  PASS  %s\n' "$name"
+  else fail=$((fail+1)); printf '  FAIL  %s\n' "$name"; fi
+}
+
+# (f) Keychain hardening is OPT-IN. None of the three install runs above passed
+#     --harden-keychain, so the seam stub must NOT have fired.
+[ ! -f "$KEYCHAIN_MARKER" ]; ok "(f) default install does NOT harden keychain" $?
+
+# (f) With --harden-keychain, the seam runs `<cmd> erase` exactly once for the
+#     run. (Scripted mode skips the interactive prompt; the flag forces it on.)
+printf '%s\n' "$TMP/folder-a" "account-a" "Account A2" "a2@users.noreply.github.com" "" \
+  | bash "$INSTALL" --non-interactive-from-stdin --harden-keychain >/dev/null 2>&1
+[ -f "$KEYCHAIN_MARKER" ]; ok "(f) --harden-keychain triggers credential erase" $?
+grepf "(f) keychain erase invoked with the 'erase' verb" "$KEYCHAIN_MARKER" "erased .*erase"
+
+# --- uninstall: reverse the wiring (folders.json read FIRST, then each layer) ---
+bash "$UNINSTALL" --non-interactive >/dev/null 2>&1
+
+# (g) ~/.gitconfig includeIf lines for both folders are gone.
+grep -F "gitdir/i:$TMP/folder-a/" "$GITCONFIG" >/dev/null 2>&1; [ "$?" != 0 ]; ok "(g) includeIf for folder-a removed" $?
+grep -F "gitdir/i:$TMP/folder-b/" "$GITCONFIG" >/dev/null 2>&1; [ "$?" != 0 ]; ok "(g) includeIf for folder-b removed" $?
+
+# (g) per-folder settings.local.json removed (install owns the whole file).
+[ ! -f "$SL" ]; ok "(g) folder-a settings.local.json removed" $?
+[ ! -f "$TMP/folder-b/.claude/settings.local.json" ]; ok "(g) folder-b settings.local.json removed" $?
+
+# (g) global ~/.claude/settings.json no longer wires the guard or session-init.
+jqf "(g) global SessionStart no longer runs session-init" \
+  "$GS" '[.hooks.SessionStart[]? | select((.hooks // [])[]?.command | test("identity-session-init.sh"))] | length == 0'
+jqf "(g) global PreToolUse no longer runs the guard" \
+  "$GS" '[.hooks.PreToolUse[]? | select((.hooks // [])[]?.command | test("identity-guard.sh"))] | length == 0'
+
+# (g) folders.json entries cleared (empty array, or file gone).
+if [ -f "$CFG" ]; then
+  jqf "(g) folders.json has no remaining entries" "$CFG" 'length == 0'
+else
+  pass=$((pass+1)); printf '  PASS  %s\n' "(g) folders.json removed"
+fi
+
+# (g) per-account gitconfig is LEFT IN PLACE by default (only --purge removes it).
+[ -f "$GC" ]; ok "(g) per-account gitconfig left intact (no --purge)" $?
+
+# (h) uninstall is idempotent: a second run with config already cleared exits 0.
+bash "$UNINSTALL" --non-interactive >/dev/null 2>&1; ok "(h) second uninstall is a clean no-op" $?
+
+# (h) --purge additionally removes the per-account gitconfig. The path was read
+#     from folders.json on the FIRST uninstall, so re-seed one entry, then purge.
+printf '%s\n' "$TMP/folder-a" "account-a" "Account A2" "a2@users.noreply.github.com" "" \
+  | bash "$INSTALL" --non-interactive-from-stdin >/dev/null 2>&1
+bash "$UNINSTALL" --non-interactive --purge >/dev/null 2>&1
+[ ! -f "$GC" ]; ok "(h) --purge removes the per-account gitconfig" $?
 
 echo "=== $pass passed, $fail failed ==="; [ "$fail" = 0 ]

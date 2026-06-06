@@ -23,22 +23,29 @@ HOOKS_DIR="$HOME/.claude/hooks"
 GLOBAL_SETTINGS="$HOME/.claude/settings.json"
 
 SCRIPTED=0
+HARDEN=0   # --harden-keychain (or an interactive yes) forces osxkeychain hardening
 for arg in "$@"; do
   case "$arg" in
     --non-interactive-from-stdin) SCRIPTED=1 ;;
+    --harden-keychain)            HARDEN=1 ;;
     -h|--help)
       cat <<'USAGE'
-Usage: install.sh [--non-interactive-from-stdin]
+Usage: install.sh [--non-interactive-from-stdin] [--harden-keychain]
 
 Locks one or more local folders each to a specific GitHub account by recording
 them in ~/.config/identity-lock/folders.json.
 
 Interactive mode (default): prompts for folder path, GitHub account, git name,
-and commit email, looping until you leave the path blank.
+and commit email, looping until you leave the path blank. Then offers to harden
+git pushes to fail-closed (default no).
 
 Scripted mode (--non-interactive-from-stdin): reads the same four answers per
 folder from stdin (one per line); a blank path line or EOF ends the loop. Used
 by the test suite.
+
+--harden-keychain: erase any stored github.com credential from the macOS login
+keychain so a push without a per-folder helper FAILS rather than falling back to
+the wrong identity. Off by default; harmless on non-macOS (the erase is a no-op).
 USAGE
       exit 0 ;;
   esac
@@ -63,6 +70,22 @@ ask()  { # ask <var> <prompt> [default]; in scripted mode reads a bare line from
 
 # The PreToolUse matcher used by both the per-folder and the global wiring.
 GUARD_MATCHER='Bash|mcp__plugin_github_github__.*'
+
+# Opt-in osxkeychain hardening. We erase any stored github.com credential so a
+# push from a locked folder cannot silently fall back to a cached (wrong-account)
+# password — it fails closed, forcing the per-folder `gh auth token` helper.
+#
+# The command is overridable via $IDENTITY_OSXKEYCHAIN_CMD ONLY for the test seam;
+# the default is byte-for-byte `git credential-osxkeychain`. We deliberately do NOT
+# stub this via a PATH shim: git resolves `credential-osxkeychain` from its own
+# exec-path, so a PATH stub would be shadowed on macOS yet honored on Linux CI —
+# i.e. it could erase the tester's real credential locally while passing in CI.
+harden_keychain() {
+  local cmd="${IDENTITY_OSXKEYCHAIN_CMD:-git credential-osxkeychain}"
+  # Unquoted on purpose so the default splits into `git` + `credential-osxkeychain`.
+  printf 'protocol=https\nhost=github.com\n' | $cmd erase 2>/dev/null
+  note "  hardened: erased stored github.com credential (pushes now fail-closed)"
+}
 
 # install_hooks: copy the guard, session-init, and resolve-account lib into
 # ~/.claude/hooks/ (+ lib/), then merge the global SessionStart + PreToolUse
@@ -239,7 +262,28 @@ merged="$(jq -n --argjson existing "$existing" --argjson new "$entries" '
 printf '%s\n' "$merged" > "$CONFIG"
 chmod 600 "$CONFIG" 2>/dev/null || true
 
+# --- opt-in: harden pushes to fail-closed (osxkeychain erase) -------------------
+# Interactive runs ask (default NO); scripted runs never prompt — the loop already
+# consumed every stdin line, so prompting here would desync. --harden-keychain
+# forces it on in either mode.
+if [ "$HARDEN" != 1 ] && [ "$SCRIPTED" != 1 ]; then
+  reply=""
+  IFS= read -r -p "Harden pushes to fail-closed? (erase stored github.com credential) [y/N]: " reply </dev/tty 2>/dev/null || reply=""
+  case "$reply" in [yY]|[yY][eE][sS]) HARDEN=1 ;; esac
+fi
+[ "$HARDEN" = 1 ] && harden_keychain
+
 note ""
-note "Wrote $collected folder lock(s) to $CONFIG"
-note "Wired: per-account gitconfig + includeIf, credential helper, per-folder"
-note "settings.local.json (env + guard), and global ~/.claude hooks."
+note "=== git-identity-guard: install summary ==="
+note "Locked $collected folder(s); config: $CONFIG"
+note "Wired per locked folder:"
+note "  L1 identity   : ~/.config/git/<account>.gitconfig + ~/.gitconfig includeIf"
+note "  L3 git push   : credential helper -> gh auth token --user <account>"
+note "  L2/L4 CC + MCP: <folder>/.claude/settings.local.json (env pins + guard)"
+note "Wired globally  : ~/.claude hooks + settings.json (SessionStart + PreToolUse)"
+if [ "$HARDEN" = 1 ]; then
+  note "Keychain harden : ON  (stored github.com credential erased; pushes fail-closed)"
+else
+  note "Keychain harden : off (re-run with --harden-keychain to enable)"
+fi
+note "Uninstall with  : ./uninstall.sh   (add --purge to also drop per-account gitconfig)"
