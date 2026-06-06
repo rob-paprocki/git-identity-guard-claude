@@ -17,16 +17,21 @@ cd "$REPO" || { echo "leak-gate: cannot cd to repo root" >&2; exit 2; }
 # (e.g. /Users[/]) on purpose: an unbracketed home-path literal anywhere —
 # including in this gate — would otherwise make the gate flag itself. The
 # bracketed form is regex-equivalent for matching real paths but, because the
-# slash sits inside a class, is not itself a matchable home-path literal.
+# slash sits inside a class, is not itself a matchable home-path literal. The
+# numeric-ID noreply-email shape uses the same trick ([+], [.]); together with
+# its leading [0-9]{6,} class, this definition can never match itself either.
 #   - /Users[/][^/ ]+   machine path on macOS
 #   - /home[/][^/ ]+    machine path on Linux
 #   - gh[oprs]_[A-Za-z0-9]{20,}  gh CLI / OAuth / PAT / refresh / server tokens
-SHAPES='(/Users[/][^/ ]+|/home[/][^/ ]+|gh[oprs]_[A-Za-z0-9]{20,})'
+#   - [0-9]{6,}[+]...@users.noreply.github.com  real numeric-user-id commit email
+SHAPES='(/Users[/][^/ ]+|/home[/][^/ ]+|gh[oprs]_[A-Za-z0-9]{20,}|[0-9]{6,}[+][A-Za-z0-9-]+@users[.]noreply[.]github[.]com)'
 
-# Noreply commit emails are allowed in their anonymized fixture/placeholder form
-# (e.g. a@users.noreply.github.com, 0000000+account-a@users.noreply.github.com).
-# A real numeric-user-id email would be caught by the gitignored denylist below.
-ALLOW='users\.noreply\.github\.com'
+# Anonymized placeholder forms that legitimately match a shape above but are safe
+# to commit: all-zero numeric prefixes (0000000+...), the documented account
+# placeholders (account-a/account-b), and the maintainer-handle placeholder
+# (your-gh-handle, which the owner swaps for their real handle at publish time).
+# The optional gitignored denylist below adds the owner's real private terms.
+ALLOW='(0{6,}[+]|account-[ab]|your-gh-handle)'
 
 status=0
 
@@ -59,7 +64,8 @@ if [ "${1:-}" = "--self-test" ]; then
   # concatenation keeps the literals below the gate's own self-match threshold.
   bad_path="/Users""/somebody/project"
   bad_token="gho""_$(printf 'A%.0s' {1..30})"
-  for s in "$bad_path" "$bad_token"; do
+  bad_email="1234567""+notarealhandle@users.noreply.github.com"
+  for s in "$bad_path" "$bad_token" "$bad_email"; do
     if caught "$s"; then echo "  self-test PASS caught: $s"
     else echo "  self-test FAIL missed: $s"; st=1; fi
   done

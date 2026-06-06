@@ -5,11 +5,11 @@
   "version": "0.1.0",
   "description": "Locks each configured local folder to a specific GitHub account: a PreToolUse deny-guard plus a SessionStart reminder enforce the pinned commit author, gh/MCP account, and push credentials per folder.",
   "author": {
-    "name": "your-gh-handle",
-    "url": "https://github.com/your-gh-handle"
+    "name": "rob-paprocki",
+    "url": "https://github.com/rob-paprocki"
   },
-  "homepage": "https://github.com/your-gh-handle/git-identity-guard-claude",
-  "repository": "https://github.com/your-gh-handle/git-identity-guard-claude",
+  "homepage": "https://github.com/rob-paprocki/git-identity-guard-claude",
+  "repository": "https://github.com/rob-paprocki/git-identity-guard-claude",
   "license": "MIT",
   "keywords": ["git", "github", "identity", "security", "guard", "hooks"],
   "hooks": "./hooks/hooks.json",

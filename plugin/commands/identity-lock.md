@@ -25,10 +25,12 @@ Each entry has the shape:
 }
 ```
 
-The installer and uninstaller scripts live at the repo / plugin root as
-`install.sh` and `uninstall.sh`. Resolve their absolute paths from the plugin's
-own directory before running them (for the bundled hooks, use
-`"${CLAUDE_PLUGIN_ROOT}"`).
+The installer and uninstaller scripts (`install.sh`, `uninstall.sh`) live at the
+**repository root** — they are *not* bundled inside the plugin (only the guard,
+session-init, and resolver scripts are, under `"${CLAUDE_PLUGIN_ROOT}"`). Run
+`install.sh` / `uninstall.sh` from your local checkout of the
+git-identity-guard-claude repo; the examples below use `/path/to/install.sh` for
+that absolute path.
 
 ## Subcommands
 

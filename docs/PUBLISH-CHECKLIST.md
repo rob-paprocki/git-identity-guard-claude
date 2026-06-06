@@ -47,8 +47,8 @@ The gate in step 2 only scans the current tree. Before publishing, scan **every
 commit** — a leaked identifier in an old commit is still public once pushed.
 
 ```bash
-SHAPES='(/Users[/][^/ ]+|/home[/][^/ ]+|gh[oprs]_[A-Za-z0-9]{20,})'
-ALLOW='users\.noreply\.github\.com'
+SHAPES='(/Users[/][^/ ]+|/home[/][^/ ]+|gh[oprs]_[A-Za-z0-9]{20,}|[0-9]{6,}[+][A-Za-z0-9-]+@users[.]noreply[.]github[.]com)'
+ALLOW='(0{6,}[+]|account-[ab]|your-gh-handle)'
 git grep -InE "$SHAPES" $(git rev-list --all) -- . ':!docs/' | grep -vE "$ALLOW" \
   && echo LEAK || echo clean
 ```
