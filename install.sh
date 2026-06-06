@@ -13,8 +13,14 @@
 # where a blank PATH (or EOF) terminates the loop.
 set -u
 
+# The installer's own directory — source of the hooks/lib we copy into ~/.claude.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 CONFIG_DIR="${IDENTITY_LOCK_DIR:-$HOME/.config/identity-lock}"
 CONFIG="${IDENTITY_LOCK_CONFIG:-$CONFIG_DIR/folders.json}"
+# Where the guard/session-init hooks + the resolve-account lib are installed.
+HOOKS_DIR="$HOME/.claude/hooks"
+GLOBAL_SETTINGS="$HOME/.claude/settings.json"
 
 SCRIPTED=0
 for arg in "$@"; do
@@ -53,6 +59,92 @@ ask()  { # ask <var> <prompt> [default]; in scripted mode reads a bare line from
     fi
   fi
   printf -v "$__var" '%s' "$__reply"
+}
+
+# The PreToolUse matcher used by both the per-folder and the global wiring.
+GUARD_MATCHER='Bash|mcp__plugin_github_github__.*'
+
+# install_hooks: copy the guard, session-init, and resolve-account lib into
+# ~/.claude/hooks/ (+ lib/), then merge the global SessionStart + PreToolUse
+# wiring into ~/.claude/settings.json. Idempotent: re-running adds no duplicates.
+install_hooks() {
+  mkdir -p "$HOOKS_DIR/lib"
+  install -m 755 "$SCRIPT_DIR/identity-guard.sh"        "$HOOKS_DIR/" 2>/dev/null
+  install -m 755 "$SCRIPT_DIR/identity-session-init.sh" "$HOOKS_DIR/" 2>/dev/null
+  install -m 644 "$SCRIPT_DIR/lib/resolve-account.sh"   "$HOOKS_DIR/lib/" 2>/dev/null
+
+  local guard="bash $HOOKS_DIR/identity-guard.sh"
+  local init="bash $HOOKS_DIR/identity-session-init.sh"
+
+  mkdir -p "$(dirname "$GLOBAL_SETTINGS")"
+  local cur="{}"
+  if [ -f "$GLOBAL_SETTINGS" ]; then
+    cur="$(jq '.' "$GLOBAL_SETTINGS" 2>/dev/null)" || cur="{}"
+    [ -z "$cur" ] && cur="{}"
+  fi
+
+  # Add the SessionStart hook only if no existing SessionStart entry already runs
+  # identity-session-init.sh; likewise the PreToolUse guard only if absent. Match
+  # on the command substring so re-runs (and pre-existing user wiring) don't dupe.
+  local merged
+  merged="$(printf '%s' "$cur" | jq \
+    --arg guard "$guard" --arg init "$init" --arg matcher "$GUARD_MATCHER" '
+    .hooks = (.hooks // {})
+    | .hooks.SessionStart = (.hooks.SessionStart // [])
+    | .hooks.PreToolUse   = (.hooks.PreToolUse   // [])
+    | (if any(.hooks.SessionStart[]?; (.hooks // [])[]?.command | . == $init)
+       then .
+       else .hooks.SessionStart += [ {hooks:[ {type:"command", command:$init, timeout:10} ]} ]
+       end)
+    | (if any(.hooks.PreToolUse[]?; (.hooks // [])[]?.command | . == $guard)
+       then .
+       else .hooks.PreToolUse += [ {matcher:$matcher, hooks:[ {type:"command", command:$guard, timeout:15} ]} ]
+       end)')"
+
+  if [ -n "$merged" ]; then
+    printf '%s\n' "$merged" > "$GLOBAL_SETTINGS"
+  fi
+}
+
+# wire_folder <path> <account> <name> <email>: wire the four pinning layers for
+# one locked folder. Idempotent — safe to re-run for the same path/account.
+wire_folder() {
+  local path="$1" account="$2" name="$3" email="$4"
+
+  # --- L1/L3: per-account gitconfig (identity + credential helper) -------------
+  local gc="$HOME/.config/git/$account.gitconfig"
+  mkdir -p "$(dirname "$gc")"
+  git config -f "$gc" user.name  "$name"
+  git config -f "$gc" user.email "$email"
+  # Reset the (possibly multivalued) helper to a single empty value, then add the
+  # real helper. --replace-all collapses any prior duplicates so re-running yields
+  # exactly ['', '<helper>'] every time (idempotent; defeats osxkeychain by order).
+  git config -f "$gc" --replace-all 'credential.https://github.com.helper' '' 2>/dev/null
+  git config -f "$gc" --add 'credential.https://github.com.helper' \
+    "!f() { test \"\$1\" = get && echo username=x-access-token && echo \"password=\$(gh auth token --user $account)\"; }; f"
+
+  # --- L1: ~/.gitconfig includeIf -> the per-account gitconfig (idempotent) -----
+  local gitconfig="$HOME/.gitconfig"
+  if ! grep -qF "gitdir/i:$path/" "$gitconfig" 2>/dev/null; then
+    git config -f "$gitconfig" "includeIf.gitdir/i:$path/.path" "$gc"
+  fi
+
+  # --- L2/L4: per-folder settings.local.json (env pins + PreToolUse guard) ------
+  # Token from the locked account's keyring entry. This file is gitignored.
+  local tok; tok="$(gh auth token --user "$account" 2>/dev/null)"
+  local sl="$path/.claude/settings.local.json"
+  mkdir -p "$(dirname "$sl")"
+  jq -n --arg g "bash $HOOKS_DIR/identity-guard.sh" --arg m "$GUARD_MATCHER" \
+        --arg t "$tok" --arg n "$name" --arg e "$email" '{
+    hooks: { PreToolUse: [ {matcher:$m, hooks:[ {type:"command", command:$g, timeout:15} ]} ] },
+    env: {
+      GH_TOKEN: $t,
+      GITHUB_PERSONAL_ACCESS_TOKEN: $t,
+      GIT_AUTHOR_NAME: $n,    GIT_AUTHOR_EMAIL: $e,
+      GIT_COMMITTER_NAME: $n, GIT_COMMITTER_EMAIL: $e
+    }
+  }' > "$sl"
+  chmod 600 "$sl" 2>/dev/null || true
 }
 
 # --- preflight: required tools -------------------------------------------------
@@ -116,8 +208,14 @@ while :; do
       [ .[] | select(.path != $path) ]
       + [ {path:$path, account:$account, name:$name, email:$email} ]')"
   collected=$((collected+1))
-  note "  locked $path -> $account"
+
+  # --- wire the four pinning layers for this folder (idempotent) ---
+  wire_folder "$path" "$account" "$name" "$email"
+  note "  locked $path -> $account (wired)"
 done
+
+# Install/refresh the global hooks + settings.json wiring once (idempotent).
+[ "$collected" != 0 ] && install_hooks
 
 if [ "$collected" = 0 ]; then
   note "No folders given; nothing to do."
@@ -143,4 +241,5 @@ chmod 600 "$CONFIG" 2>/dev/null || true
 
 note ""
 note "Wrote $collected folder lock(s) to $CONFIG"
-note "(Task 4: config only. Run later install steps to wire git/credential/hook layers.)"
+note "Wired: per-account gitconfig + includeIf, credential helper, per-folder"
+note "settings.local.json (env + guard), and global ~/.claude hooks."
