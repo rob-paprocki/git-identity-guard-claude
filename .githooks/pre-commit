@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# pre-commit — block commits that leak a real identifier or break a test.
+# Enable once per clone:
+#   git config core.hooksPath .githooks
+# Runs the leak gate (over staged/tracked content) then the full test suite.
+set -u
+
+REPO="$(git rev-parse --show-toplevel)"
+
+echo "[pre-commit] leak gate…"
+if ! bash "$REPO/scripts/leak-gate.sh"; then
+  echo "[pre-commit] BLOCKED: leak gate failed — remove the identifier(s) above." >&2
+  exit 1
+fi
+
+echo "[pre-commit] test suite…"
+if ! bash "$REPO/test/run.sh"; then
+  echo "[pre-commit] BLOCKED: tests failed." >&2
+  exit 1
+fi
+
+echo "[pre-commit] ok"
+exit 0

@@ -1,0 +1,27 @@
+name: test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq and gh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          # gh is preinstalled on GitHub-hosted ubuntu runners; install only if absent.
+          command -v gh >/dev/null 2>&1 || sudo apt-get install -y gh
+          jq --version
+          gh --version
+
+      - name: Run test suite
+        run: bash test/run.sh
+
+      - name: Leak gate
+        run: bash scripts/leak-gate.sh

@@ -3,6 +3,10 @@ folders.json
 *.local.json
 .claude/settings.local.json
 
+# Maintainer's private leak-gate denylist (real handles, one per line) — the
+# leak gate reads it if present but it must NEVER be committed.
+scripts/.leak-denylist
+
 # Test fixtures / scratch
 /.fixtures/
 *.tmp
