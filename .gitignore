@@ -1,0 +1,11 @@
+# Generated local config (never commit — would contain real accounts/paths/tokens)
+folders.json
+*.local.json
+.claude/settings.local.json
+
+# Test fixtures / scratch
+/.fixtures/
+*.tmp
+
+# OS
+.DS_Store
