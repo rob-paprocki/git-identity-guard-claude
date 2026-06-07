@@ -9,6 +9,7 @@ SUITES=(
   "resolve-account.test.sh"
   "identity-guard.test.sh"
   "session-init.test.sh"
+  "mcp-headers.test.sh"
   "install.test.sh"
 )
 

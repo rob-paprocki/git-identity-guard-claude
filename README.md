@@ -42,6 +42,32 @@ Each layer works on its own; together they are defense-in-depth.
 The relevant globals (active `gh` account, OS keychain, global git config) are
 left as-is and simply outranked by the per-folder configuration.
 
+### Sub-directory launches
+
+Claude Code loads a folder's `.claude/settings.local.json` only from the directory
+it was launched in, not from ancestors — so launching Claude *inside a repo nested
+under* a locked folder historically left `gh` and GitHub-MCP unpinned (only `git`
+stayed pinned, via the path-based `includeIf`). This tool closes that gap:
+
+- **`gh` / `git` (always):** the SessionStart hook resolves the locked account for
+  the launch `cwd` and writes that account's token into the session's
+  `CLAUDE_ENV_FILE`, so every `gh`/`git` command is pinned no matter how deep the
+  launch directory. It also records the locked account (never the token) in a
+  per-session pin file the guard reads to confirm pinning.
+- **GitHub MCP (opt-out):** install adds a user-scoped `github` MCP server (same
+  endpoint as the GitHub plugin) whose `headersHelper` resolves the account by
+  `cwd` at connect, so MCP is pinned in sub-directory launches too. Because a
+  user-scoped server supersedes the plugin by endpoint, **this changes the GitHub
+  MCP tool namespace machine-wide** (`mcp__plugin_github_github__*` →
+  `mcp__github__*`). Skip it with `install.sh --no-mcp-override` (the guard matches
+  both namespaces either way).
+
+The guard verifies pinning from the per-session pin file, so it stays
+**fail-closed**: an unpinned session, a logged-out locked account, or a mid-session
+`cd` into a *different* locked tree is denied rather than run as the wrong account.
+Re-pinning on a mid-session `cd` between locked trees is intentionally **not**
+handled yet — relaunch Claude in the other tree (see `ROADMAP.md`).
+
 ## Requirements
 
 - `bash`, `jq`, `git`, and the GitHub CLI (`gh`), authenticated for each account
@@ -66,11 +92,18 @@ should be locked to, and the commit `name`/`email` to use. The installer:
 2. Adds an `includeIf "gitdir/i:<path>/"` to `~/.gitconfig` pointing at a
    per-account gitconfig that sets `user.name`/`user.email` and the push
    credential helper.
-3. Writes `<path>/.claude/settings.local.json` with the per-folder hooks and
-   `env` (tokens from `gh auth token --user <acct>`, plus `GIT_AUTHOR_*` /
-   `GIT_COMMITTER_*`). This file is gitignored — it holds real tokens.
+3. Merges the per-folder hooks and `env` (tokens from `gh auth token --user <acct>`,
+   plus `GIT_AUTHOR_*` / `GIT_COMMITTER_*`) into `<path>/.claude/settings.local.json`,
+   **preserving any keys you already have there** (e.g. a permissions allowlist).
+   This file is gitignored — it holds real tokens.
 4. Merges the global hook wiring into `~/.claude/settings.json` (idempotent).
-5. Installs the guard + session-init hooks into `~/.claude/hooks/`.
+5. Installs the guard, session-init, and MCP-headers hooks into `~/.claude/hooks/`.
+6. Adds the user-scoped GitHub MCP override to `~/.claude.json` (default on; skip
+   with `--no-mcp-override`). See **Sub-directory launches** for the namespace caveat.
+7. Writes a managed `CLAUDE.md` identity contract into each locked folder from one
+   canonical template (only the account handle differs). It carries a `managed by
+   git-identity-guard` marker and is **never** written over a hand-customized
+   `CLAUDE.md` (one without the marker is left untouched).
 
 The installer is idempotent and merges by path, so re-running it safely
 refreshes an existing lock. The config schema is documented in
@@ -105,13 +138,16 @@ the keychain holds. This is opt-in and off by default.
    - writes to identity-bearing config files;
    - out-of-tree `git -C <other path>` operations;
    - `git am` / author-reuse that would carry a foreign identity.
-3. For GitHub-MCP writes and for `gh`/MCP commands that are not pinned to the
-   locked account, it **fails closed** (blocks) rather than letting an unpinned
-   identity through.
+3. For GitHub-MCP writes and for `gh`/MCP commands, it **fails closed**: it allows
+   them only when the session is provably pinned to the locked account — either the
+   in-env `GH_TOKEN`/`GITHUB_PERSONAL_ACCESS_TOKEN` matches (root launch) or the
+   per-session pin file names the locked account (sub-directory launch). An unpinned
+   session, or a locked account that isn't logged in to `gh`, is blocked.
 
 `identity-session-init.sh` is a **SessionStart** hook that injects a reminder of
-which account governs the current folder, and warns when the session starts in a
-sub-directory of a locked folder.
+which account governs the current folder, pins `gh`/`git` for sub-directory launches
+via the session env-file (and records the per-session pin file the guard reads), and
+notes when a session starts in a sub-directory.
 
 ## Plain `git` / `gh` (without Claude Code)
 
@@ -179,9 +215,12 @@ acknowledging the residual floor above:
 ```
 
 `uninstall.sh` reverses every wiring step recorded in `folders.json`: it drops
-the `includeIf` sections, removes the per-folder `settings.local.json`, and
-clears the global hook wiring. It leaves the per-account gitconfig in place
-unless `--purge` is given. It is idempotent.
+the `includeIf` sections, removes **only our keys** from each per-folder
+`settings.local.json` (preserving any other keys you have there, and deleting the
+file only if nothing else remains), deletes the managed `CLAUDE.md` from each folder
+(only if it carries our marker), clears the global hook wiring, and removes the
+GitHub MCP override it added (only if it's ours). It leaves the per-account
+gitconfig in place unless `--purge` is given. It is idempotent.
 
 ## Development
 

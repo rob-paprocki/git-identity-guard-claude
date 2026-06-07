@@ -21,6 +21,7 @@ CONFIG="${IDENTITY_LOCK_CONFIG:-$CONFIG_DIR/folders.json}"
 HOOKS_DIR="$HOME/.claude/hooks"
 GLOBAL_SETTINGS="$HOME/.claude/settings.json"
 GITCONFIG="$HOME/.gitconfig"
+CLAUDE_JSON="$HOME/.claude.json"
 
 SCRIPTED=0   # accepted for symmetry with install.sh; uninstall takes no stdin
 PURGE=0
@@ -68,11 +69,29 @@ unwire_global() {
   [ -n "$merged" ] && printf '%s\n' "$merged" > "$GLOBAL_SETTINGS"
 }
 
+# unwire_mcp_override: remove the user-scoped `github` MCP server from ~/.claude.json,
+# but ONLY if it's the one we installed (its headersHelper points at our script). A
+# user's own github MCP server is left intact. Atomic; idempotent; clean no-op when
+# absent or not ours.
+unwire_mcp_override() {
+  [ -f "$CLAUDE_JSON" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  jq -e '(.mcpServers.github.headersHelper // "") | test("mcp-github-headers.sh")' \
+    "$CLAUDE_JSON" >/dev/null 2>&1 || return 0
+  local merged
+  merged="$(jq 'del(.mcpServers.github)
+    | (if (.mcpServers // {}) == {} then del(.mcpServers) else . end)' "$CLAUDE_JSON" 2>/dev/null)"
+  if [ -n "$merged" ] && printf '%s' "$merged" | jq -e . >/dev/null 2>&1; then
+    printf '%s\n' "$merged" > "$CLAUDE_JSON.idlock.tmp" && mv "$CLAUDE_JSON.idlock.tmp" "$CLAUDE_JSON"
+  fi
+}
+
 # Nothing to do if the config is absent: clean no-op (idempotent second run).
 if [ ! -f "$CONFIG" ]; then
   note "No config at $CONFIG; nothing to uninstall."
-  # Still scrub the global hook wiring in case the config was removed manually.
+  # Still scrub the global hook wiring + MCP override in case the config was removed manually.
   unwire_global
+  unwire_mcp_override
   exit 0
 fi
 
@@ -92,12 +111,34 @@ while IFS=$'\t' read -r path account; do
     git config -f "$GITCONFIG" --remove-section "includeIf.gitdir/i:$path/" 2>/dev/null
   fi
 
-  # 2. per-folder settings.local.json — install owns the whole file, so remove it
-  #    (and prune an empty .claude dir we may have created).
+  # 2. per-folder settings.local.json — remove ONLY our keys (the guard hook entry +
+  #    our env pins), preserving any other user keys (e.g. a permissions allowlist).
+  #    Delete the file only if nothing meaningful remains (it became {}).
   sl="$path/.claude/settings.local.json"
-  if [ -f "$sl" ]; then
-    rm -f "$sl"
-    rmdir "$path/.claude" 2>/dev/null || true
+  if [ -f "$sl" ] && command -v jq >/dev/null 2>&1; then
+    cleaned="$(jq '
+      del(.env.GH_TOKEN, .env.GITHUB_PERSONAL_ACCESS_TOKEN, .env.GIT_AUTHOR_NAME,
+          .env.GIT_AUTHOR_EMAIL, .env.GIT_COMMITTER_NAME, .env.GIT_COMMITTER_EMAIL)
+      | (if .env == {} then del(.env) else . end)
+      | (if .hooks.PreToolUse then
+           .hooks.PreToolUse = [ .hooks.PreToolUse[]
+             | select(((.hooks // [])[]?.command // "") | test("identity-guard.sh") | not) ]
+           | (if .hooks.PreToolUse == [] then del(.hooks.PreToolUse) else . end)
+         else . end)
+      | (if .hooks == {} then del(.hooks) else . end)' "$sl" 2>/dev/null)"
+    if [ -n "$cleaned" ] && [ "$(printf '%s' "$cleaned" | jq -c . 2>/dev/null)" != "{}" ]; then
+      printf '%s\n' "$cleaned" > "$sl.tmp" && mv "$sl.tmp" "$sl"
+    else
+      rm -f "$sl"; rmdir "$path/.claude" 2>/dev/null || true
+    fi
+  elif [ -f "$sl" ]; then
+    rm -f "$sl"; rmdir "$path/.claude" 2>/dev/null || true
+  fi
+
+  # 2b. managed CLAUDE.md — remove only if it carries our marker (a hand-written one is kept).
+  cm="$path/CLAUDE.md"
+  if [ -f "$cm" ] && grep -q 'managed by git-identity-guard' "$cm" 2>/dev/null; then
+    rm -f "$cm"
   fi
 
   # 3. --purge: drop the per-account gitconfig too (default: keep it).
@@ -111,8 +152,9 @@ done <<EOF
 $rows
 EOF
 
-# 4. global ~/.claude/settings.json hook wiring (guard + session-init).
+# 4. global ~/.claude/settings.json hook wiring (guard + session-init) + MCP override.
 unwire_global
+unwire_mcp_override
 
 # 5. clear folders.json (remove the file so a second run is a clean no-op).
 rm -f "$CONFIG" 2>/dev/null
@@ -121,7 +163,7 @@ note ""
 note "=== git-identity-guard: uninstall summary ==="
 note "Unlocked $removed folder(s); removed $CONFIG"
 note "Removed: ~/.gitconfig includeIf lines, per-folder settings.local.json,"
-note "global ~/.claude hook wiring."
+note "global ~/.claude hook wiring, and our GitHub MCP override (if present)."
 if [ "$PURGE" = 1 ]; then
   note "Purged : per-account ~/.config/git/<account>.gitconfig files."
 else

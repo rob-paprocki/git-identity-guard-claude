@@ -27,10 +27,16 @@ Each entry has the shape:
 
 The installer and uninstaller scripts (`install.sh`, `uninstall.sh`) live at the
 **repository root** — they are *not* bundled inside the plugin (only the guard,
-session-init, and resolver scripts are, under `"${CLAUDE_PLUGIN_ROOT}"`). Run
-`install.sh` / `uninstall.sh` from your local checkout of the
-git-identity-guard-claude repo; the examples below use `/path/to/install.sh` for
-that absolute path.
+session-init, MCP-headers, and resolver scripts are, under
+`"${CLAUDE_PLUGIN_ROOT}"`). Run `install.sh` / `uninstall.sh` from your local
+checkout of the git-identity-guard-claude repo; the examples below use
+`/path/to/install.sh` for that absolute path.
+
+Locks work from **sub-directory launches**, not just a folder root: the
+SessionStart hook pins `gh`/`git` for the launch `cwd` via the session env-file,
+and (unless you pass `install.sh --no-mcp-override`) a user-scoped GitHub MCP
+override pins MCP too. The MCP override changes the GitHub MCP tool namespace
+machine-wide (`mcp__plugin_github_github__*` → `mcp__github__*`).
 
 ## Subcommands
 
@@ -68,12 +74,13 @@ fire there). Note whether the match was the folder itself or a parent
 
 ### `add [path] [account]`
 
-Lock a new folder. This wires all four layers (gitconfig `includeIf`,
-credential helper, per-folder `settings.local.json`, and the global hooks), so
-it must run the installer rather than editing the config directly. Confirm the
-GitHub account and the commit `name`/`email` with the user, then run the
-installer in scripted mode — it reads four lines per folder (path, account,
-name, email) and a blank line ends the loop:
+Lock a new folder. This wires every pinning layer (gitconfig `includeIf`,
+credential helper, per-folder `settings.local.json`, the global hooks, and —
+unless `--no-mcp-override` — the user-scoped GitHub MCP override), so it must run
+the installer rather than editing the config directly. Confirm the GitHub account
+and the commit `name`/`email` with the user, then run the installer in scripted
+mode — it reads four lines per folder (path, account, name, email) and a blank
+line ends the loop:
 
 ```bash
 printf '%s\n' \

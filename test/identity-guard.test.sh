@@ -12,13 +12,19 @@
 GUARD="$(cd "$(dirname "$0")/.." && pwd)/identity-guard.sh"
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-A="$TMP/folder-a"; B="$TMP/folder-b"; OUT="$TMP/elsewhere"; mkdir -p "$A" "$B" "$OUT"
+A="$TMP/folder-a"; B="$TMP/folder-b"; C="$TMP/folder-c"; OUT="$TMP/elsewhere"; mkdir -p "$A" "$B" "$C" "$OUT"
 RE="0000000+account-a@users.noreply.github.com"            # fixture "locked email"
 cat > "$TMP/folders.json" <<EOF
 [ {"path":"$A","account":"account-a","name":"Account A","email":"$RE"},
-  {"path":"$B","account":"account-b","name":"Account B","email":"0001+account-b@users.noreply.github.com"} ]
+  {"path":"$B","account":"account-b","name":"Account B","email":"0001+account-b@users.noreply.github.com"},
+  {"path":"$C","account":"account-c","name":"Account C","email":"0002+account-c@users.noreply.github.com"} ]
 EOF
 export IDENTITY_LOCK_CONFIG="$TMP/folders.json"
+
+# Session pin files (written by SessionStart; the guard reads them to verify a
+# sub-directory launch is really pinned). account-c is intentionally absent from
+# the gh stub -> `gh auth token --user account-c` is empty (account "logged out").
+SESS="$TMP/sessions"; export IDENTITY_LOCK_SESSIONS="$SESS"; mkdir -p "$SESS"
 
 # Stub gh on PATH so tests never touch the real gh keyring.
 mkdir -p "$TMP/bin"
@@ -59,6 +65,22 @@ rawok() { local name="$1" exp="$2" cmd="$3" cwd="$4" tok="$5" out got pl
   if [ "$tok" = "__unset__" ]; then out=$(printf '%s' "$pl" | env -u GH_TOKEN bash "$GUARD" 2>/dev/null)
   else out=$(printf '%s' "$pl" | GH_TOKEN="$tok" bash "$GUARD" 2>/dev/null); fi
   got=$(classify "$out")
+  if [ "$got" = "$exp" ]; then pass=$((pass+1)); printf '  PASS  %-52s [%s]\n' "$name" "$got"
+  else fail=$((fail+1)); printf '  FAIL  %-52s want=%s got=%s\n' "$name" "$exp" "$got"; F+=("$name"); fi; }
+
+# pinrun: SUB-DIRECTORY launch (GH_TOKEN unset). Seeds the session pin file to
+# <pin> (empty = no pin) before running the guard with that session_id.
+pinrun() { local name="$1" exp="$2" cmd="$3" cwd="$4" sid="$5" pin="$6" out got pl
+  rm -f "$SESS/$sid"; [ -n "$pin" ] && printf '%s\n' "$pin" > "$SESS/$sid"
+  pl=$(jq -n --arg c "$cmd" --arg d "$cwd" --arg s "$sid" '{tool_name:"Bash",cwd:$d,session_id:$s,tool_input:{command:$c}}')
+  out=$(printf '%s' "$pl" | env -u GH_TOKEN bash "$GUARD" 2>/dev/null); got=$(classify "$out")
+  if [ "$got" = "$exp" ]; then pass=$((pass+1)); printf '  PASS  %-52s [%s]\n' "$name" "$got"
+  else fail=$((fail+1)); printf '  FAIL  %-52s want=%s got=%s\n' "$name" "$exp" "$got"; F+=("$name"); fi; }
+# pinmcp: SUB-DIRECTORY MCP call (GITHUB_PERSONAL_ACCESS_TOKEN unset). Seeds the pin.
+pinmcp() { local name="$1" exp="$2" tool="$3" cwd="$4" sid="$5" pin="$6" out got pl
+  rm -f "$SESS/$sid"; [ -n "$pin" ] && printf '%s\n' "$pin" > "$SESS/$sid"
+  pl=$(jq -n --arg t "$tool" --arg d "$cwd" --arg s "$sid" '{tool_name:$t,cwd:$d,session_id:$s,tool_input:{}}')
+  out=$(printf '%s' "$pl" | env -u GH_TOKEN -u GITHUB_PERSONAL_ACCESS_TOKEN bash "$GUARD" 2>/dev/null); got=$(classify "$out")
   if [ "$got" = "$exp" ]; then pass=$((pass+1)); printf '  PASS  %-52s [%s]\n' "$name" "$got"
   else fail=$((fail+1)); printf '  FAIL  %-52s want=%s got=%s\n' "$name" "$exp" "$got"; F+=("$name"); fi; }
 
@@ -238,6 +260,31 @@ ok "MCP write wrong token -> DENY"  DENY  mcp__plugin_github_github__create_pull
 ok "MCP write no token -> DENY"     DENY  mcp__plugin_github_github__push_files "" "$A"
 ok "MCP read tool -> ALLOW"         ALLOW mcp__plugin_github_github__get_file_contents "" "$A" "$OTHER"
 ok "MCP write outside tree -> ALLOW" ALLOW mcp__plugin_github_github__create_pull_request "" "$OUT" "$OTHER"
+
+# ---- sub-directory launch: pinned by SessionStart -> ALLOW; unpinned/cross-tree -> DENY ----
+pinrun "subdir gh pinned to account-a -> ALLOW"       ALLOW "gh pr create"   "$A/sub" "sid1" "account-a"
+pinrun "subdir gh read pinned -> ALLOW"               ALLOW "gh pr list"     "$A/sub" "sid1" "account-a"
+pinrun "subdir gh NO pin -> DENY"                     DENY  "gh pr create"   "$A/sub" "sid2" ""
+pinrun "subdir gh cross-tree pin (b in a) -> DENY"    DENY  "gh pr create"   "$A/sub" "sid3" "account-b"
+pinrun "subdir gh pin but account logged out -> DENY" DENY  "gh pr create"   "$C/sub" "sid4" "account-c"
+pinrun "subdir gh auth status (exempt) -> ALLOW"      ALLOW "gh auth status" "$A/sub" "sid5" ""
+pinrun "subdir git push (helper pins) -> ALLOW"       ALLOW "git push"       "$A/sub" "sid6" ""
+
+# ---- want-empty (locked account not in keyring) fail-closed even at a root launch ----
+rawok "root gh but account logged out -> DENY"        DENY  "gh pr create"   "$C" "STALETOKEN"
+
+# ---- MCP sub-directory launch via the headersHelper override (token NOT in hook env) ----
+pinmcp "subdir MCP write pinned -> ALLOW"             ALLOW mcp__plugin_github_github__create_pull_request "$A/sub" "m1" "account-a"
+pinmcp "subdir MCP write NO pin -> DENY"              DENY  mcp__plugin_github_github__create_pull_request "$A/sub" "m2" ""
+pinmcp "subdir MCP write cross-tree pin -> DENY"      DENY  mcp__plugin_github_github__push_files          "$A/sub" "m3" "account-b"
+pinmcp "subdir MCP read pinned -> ALLOW"              ALLOW mcp__plugin_github_github__get_file_contents   "$A/sub" "m4" "account-a"
+
+# ---- NEW namespace from the user-scoped override: mcp__github__* must be matched too ----
+ok     "override-ns MCP write a token -> ALLOW"       ALLOW mcp__github__create_pull_request "" "$A" "$ROBTOK"
+ok     "override-ns MCP write wrong token -> DENY"    DENY  mcp__github__create_pull_request "" "$A" "$OTHER"
+ok     "override-ns MCP read -> ALLOW"                ALLOW mcp__github__get_file_contents   "" "$A" "$OTHER"
+pinmcp "override-ns subdir MCP write pinned -> ALLOW" ALLOW mcp__github__create_pull_request "$A/sub" "m5" "account-a"
+pinmcp "override-ns subdir MCP write NO pin -> DENY"  DENY  mcp__github__create_pull_request "$A/sub" "m6" ""
 
 echo; echo "=== $pass passed, $fail failed ==="
 [ "$fail" -gt 0 ] && { printf '  - %s\n' "${F[@]}"; exit 1; } || exit 0

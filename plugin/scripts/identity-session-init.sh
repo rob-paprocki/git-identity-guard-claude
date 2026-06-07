@@ -26,9 +26,49 @@ ROOT="$(jq -r --arg c "$cwd_lc" '
   | .path' "$IDLOCK_CFG" 2>/dev/null | head -1)"
 ROOT_LC="$(printf '%s' "$ROOT" | tr '[:upper:]' '[:lower:]')"
 
+# --- per-session identity pin: make gh / git / MCP work from SUB-DIRECTORIES ---
+# Claude Code loads .claude/settings.local.json only from the launch directory, not
+# ancestors, so a sub-directory launch never gets the folder-root env pin. Fix it
+# here: resolve the locked account's token (same source as the git credential
+# helper) and, if available, export it into this session's CLAUDE_ENV_FILE so every
+# subsequent Bash command (gh/git) is pinned regardless of where Claude was
+# launched. Record the locked ACCOUNT (never the token) in a session pin file the
+# guard reads to verify pinning. The pin file is written ONLY after a verified
+# env-file append — so "pin present" always implies "really pinned" (fail-closed):
+# a resume/compact path with no writable CLAUDE_ENV_FILE writes no pin, and the
+# guard then denies rather than letting gh fall back to the active account.
+SESS_DIR="${IDENTITY_LOCK_SESSIONS:-${IDENTITY_LOCK_DIR:-$HOME/.config/identity-lock}/sessions}"
+sid="$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)"
+pinned_ok=0
+tok="$(gh auth token --user "$LOCKED" 2>/dev/null)"
+if [ -n "$tok" ] && [ -n "${CLAUDE_ENV_FILE:-}" ]; then
+  if ! grep -q 'identity-lock pin OK' "$CLAUDE_ENV_FILE" 2>/dev/null; then
+    {
+      printf 'export GH_TOKEN=%q\n'                     "$tok"
+      printf 'export GITHUB_PERSONAL_ACCESS_TOKEN=%q\n' "$tok"
+      printf 'export GIT_AUTHOR_NAME=%q\n'              "$NAME"
+      printf 'export GIT_AUTHOR_EMAIL=%q\n'             "$EMAIL"
+      printf 'export GIT_COMMITTER_NAME=%q\n'           "$NAME"
+      printf 'export GIT_COMMITTER_EMAIL=%q\n'          "$EMAIL"
+      printf '# identity-lock pin OK %s\n'              "$LOCKED"   # marker written LAST
+    } >> "$CLAUDE_ENV_FILE" 2>/dev/null
+  fi
+  if [ -n "$sid" ] && grep -q 'identity-lock pin OK' "$CLAUDE_ENV_FILE" 2>/dev/null; then
+    if mkdir -p "$SESS_DIR" 2>/dev/null && printf '%s\n' "$LOCKED" > "$SESS_DIR/$sid" 2>/dev/null; then
+      chmod 600 "$SESS_DIR/$sid" 2>/dev/null; pinned_ok=1
+    fi
+    find "$SESS_DIR" -type f -mtime +7 -delete 2>/dev/null   # prune stale pins (best-effort)
+  fi
+fi
+
 subdir_note=""
-[ "$cwd_lc" != "$ROOT_LC" ] && \
-  subdir_note=" This session looks like a SUB-DIRECTORY of the workspace: gh/MCP may NOT be token-pinned here (git push and commit author still are). Relaunch Claude from $ROOT for full coverage."
+if [ "$cwd_lc" != "$ROOT_LC" ]; then
+  if [ "$pinned_ok" = 1 ]; then
+    subdir_note=" SUB-DIRECTORY launch: gh + GitHub-MCP are session-pinned to $LOCKED here (git push and commit author too), so you can work normally. Do NOT 'cd' into a DIFFERENT locked tree mid-session — that stays blocked; relaunch Claude there instead."
+  else
+    subdir_note=" This session is a SUB-DIRECTORY launch and the $LOCKED account could not be pinned for gh/MCP (its token was unavailable). git push and commit author still are. Relaunch Claude from $ROOT, or run 'gh auth login --user $LOCKED', for full coverage."
+  fi
+fi
 
 jq -n --arg a "$LOCKED" --arg n "$subdir_note" '{
   hookSpecificOutput: {

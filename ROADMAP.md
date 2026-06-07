@@ -10,8 +10,25 @@ a parameterized test suite + README + `config.example.json` + a thin Claude Code
 plugin + GitHub Actions CI + `CONTRIBUTING.md`. Everything below is explicitly
 out of v1.
 
+## Shipped since v1
+
+- **Sub-directory launch support** — launching Claude inside a repo nested under a
+  locked folder now pins `gh`/`git` (via the SessionStart env-file pin + a
+  per-session pin file the guard verifies) and, opt-out, GitHub MCP (via a
+  user-scoped `headersHelper` override that resolves the account by `cwd` at
+  connect). Previously only `git` stayed pinned in sub-directories; `gh`/MCP
+  fail-closed. The MCP override changes the GitHub MCP tool namespace machine-wide
+  (`mcp__plugin_github_github__*` → `mcp__github__*`); `install.sh --no-mcp-override`
+  skips it.
+
 ## Candidate future work
 
+- **Mid-session `cd` re-pinning (CwdChanged)** — re-resolve and re-pin `gh`/MCP when
+  the working directory moves *between* locked trees within a single session. Today
+  a cross-tree `cd` is fail-closed (the guard denies it); the user relaunches Claude
+  in the target tree. The env-file is re-sourced per Bash command, so a `CwdChanged`
+  hook rewriting it is feasible — but it needs its own design + tests to avoid a
+  stale-pin window.
 - **Richer plugin UX** — a status dashboard, per-folder enable/disable, and a
   `doctor` command that diagnoses a misconfigured lock.
 - **Multi-host / GitHub Enterprise support** — per-host credential helpers and

@@ -37,6 +37,14 @@ tool="$(jqr '.tool_name // empty')"
 cwd="$(jqr '.cwd // empty')"; [ -z "$cwd" ] && cwd="${CLAUDE_PROJECT_DIR:-$PWD}"
 cwd_lc="$(printf '%s' "$cwd" | tr '[:upper:]' '[:lower:]')"
 
+# Session pin: SessionStart records the locked ACCOUNT (no token) here after it has
+# verifiably pinned this session's env-file. The guard can't see the env-file's
+# GH_TOKEN/GITHUB_PERSONAL_ACCESS_TOKEN, so for sub-directory launches it confirms
+# pinning by reading this file (keyed by session_id, present in every payload).
+sid="$(jqr '.session_id // empty')"
+SESS_DIR="${IDENTITY_LOCK_SESSIONS:-${IDENTITY_LOCK_DIR:-$HOME/.config/identity-lock}/sessions}"
+session_pin() { [ -n "$sid" ] && head -1 "$SESS_DIR/$sid" 2>/dev/null; }
+
 # --- resolve the locked account for this cwd from folders.json ---
 GUARD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$GUARD_DIR/lib/resolve-account.sh" 2>/dev/null || . "$HOME/.claude/hooks/lib/resolve-account.sh"
@@ -55,12 +63,25 @@ deny() { jq -n --arg r "$1" '{hookSpecificOutput:{hookEventName:"PreToolUse",per
 
 # ===================== GitHub MCP tools =====================
 case "$tool" in
-  mcp__plugin_github_github__*)
-    action="${tool#mcp__plugin_github_github__}"
+  mcp__plugin_github_github__*|mcp__github__*)
+    # Strip BOTH possible prefixes — the plugin server (mcp__plugin_github_github__)
+    # OR the user-scoped headersHelper override (mcp__github__) — so the write
+    # classifier sees the bare action either way. Matching the new namespace in the
+    # matcher WITHOUT also stripping it here would misclassify every override-
+    # namespace write as a read and allow it (fail-open).
+    action="$tool"; action="${action#mcp__plugin_github_github__}"; action="${action#mcp__github__}"
     if printf '%s' "$action" | grep -Eq '^(create|update|delete|merge|push|fork|add_|sub_|request_)|_write$'; then
-      want="$(gh auth token --user "$LOCKED" 2>/dev/null)"; have="${GITHUB_PERSONAL_ACCESS_TOKEN:-}"
-      [ -n "$want" ] && [ "$want" = "$have" ] && exit 0
-      deny "Identity guard: GitHub MCP write '$tool' would act as a non-$LOCKED account (MCP token != $LOCKED). Use the gh CLI / git here, or relaunch Claude from the folder root so the $LOCKED token override loads."
+      want="$(gh auth token --user "$LOCKED" 2>/dev/null)"
+      [ -z "$want" ] && deny "Identity guard: GitHub MCP write '$tool' blocked — the $LOCKED account isn't available (run 'gh auth login --user $LOCKED')."
+      have="${GITHUB_PERSONAL_ACCESS_TOKEN:-}"
+      if [ -n "$have" ]; then
+        [ "$have" = "$want" ] && exit 0
+        deny "Identity guard: GitHub MCP write '$tool' would act as a non-$LOCKED account (MCP token != $LOCKED)."
+      fi
+      # Sub-directory launch: the MCP token is supplied at connect by the headersHelper
+      # override and is NOT in this hook's env. Verify pinning via the session pin file.
+      [ "$(session_pin)" = "$LOCKED" ] && exit 0
+      deny "Identity guard: GitHub MCP write '$tool' is not provably pinned to $LOCKED (no session pin — a sub-directory launch without the MCP override, or a cross-tree cd). Relaunch Claude from $ROOT, or use the gh CLI."
     fi
     exit 0 ;;
 esac
@@ -173,8 +194,19 @@ if has '\bgh\b'; then
 fi
 if [ "$gh_real" = 1 ]; then
   want="$(gh auth token --user "$LOCKED" 2>/dev/null)"
-  if [ -n "$want" ] && [ "${GH_TOKEN:-}" != "$want" ]; then
-    deny "Identity guard: this session is not token-pinned to $LOCKED (GH_TOKEN isn't the $LOCKED token — likely a sub-directory launch where .claude/settings.local.json didn't load). 'gh' would act as the active account. Relaunch Claude from the locked folder root ($ROOT) so the $LOCKED token loads, or use 'git' (push/commit stay pinned)."
+  if [ -z "$want" ]; then
+    # The locked account isn't in gh's keyring — can't pin gh to it. Fail closed
+    # (matches the MCP section), rather than letting gh use the active account.
+    deny "Identity guard: 'gh' blocked — the $LOCKED account isn't available (gh auth token --user $LOCKED is empty). Run 'gh auth login --user $LOCKED'."
+  elif [ -n "${GH_TOKEN:-}" ]; then
+    # Root launch: settings.local.json injected GH_TOKEN into this session's env.
+    [ "${GH_TOKEN}" = "$want" ] || \
+      deny "Identity guard: GH_TOKEN isn't the $LOCKED token; 'gh' would act as another account in the $LOCKED workspace."
+  else
+    # Sub-directory launch: GH_TOKEN is set via the session env-file by SessionStart
+    # (not visible to this hook). Confirm pinning via the session pin file instead.
+    [ "$(session_pin)" = "$LOCKED" ] || \
+      deny "Identity guard: this session is not token-pinned to $LOCKED (no session pin — a sub-directory launch SessionStart couldn't pin, or a cross-tree cd). Relaunch Claude from $ROOT, or use 'git' (push/commit stay pinned)."
   fi
 fi
 

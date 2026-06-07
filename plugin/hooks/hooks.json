@@ -13,7 +13,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash|mcp__plugin_github_github__.*",
+        "matcher": "Bash|mcp__plugin_github_github__.*|mcp__github__.*",
         "hooks": [
           {
             "type": "command",

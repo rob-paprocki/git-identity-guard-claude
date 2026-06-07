@@ -126,6 +126,7 @@ GC="$TMP/.config/git/account-a.gitconfig"
 GITCONFIG="$TMP/.gitconfig"
 SL="$TMP/folder-a/.claude/settings.local.json"
 GS="$TMP/.claude/settings.json"
+CLAUDE_JSON="$TMP/.claude.json"
 
 # (a) ~/.gitconfig has an includeIf "gitdir/i:<path>/" pointing at folder-a,
 #     exactly once despite folder-a being wired twice.
@@ -181,6 +182,25 @@ jqf "(d) global PreToolUse guard matcher appears exactly once (idempotent merge)
 [ -f "$TMP/.claude/hooks/lib/resolve-account.sh" ] \
   && { pass=$((pass+1)); echo "  PASS  (e) lib/resolve-account.sh installed"; } \
   || { fail=$((fail+1)); echo "  FAIL  (e) lib/resolve-account.sh missing in ~/.claude/hooks/lib/"; }
+[ -x "$TMP/.claude/hooks/mcp-github-headers.sh" ] \
+  && { pass=$((pass+1)); echo "  PASS  (e) mcp-github-headers.sh installed + executable"; } \
+  || { fail=$((fail+1)); echo "  FAIL  (e) mcp-github-headers.sh missing/non-exec in ~/.claude/hooks/"; }
+
+# ===========================================================================
+# MCP override (opt-out, default ON): a user-scoped `github` MCP server in
+# ~/.claude.json whose headersHelper resolves the account by cwd, plus the guard
+# matcher extended to the override's namespace (mcp__github__*).
+# ===========================================================================
+# (i) default install wired the github MCP override (our headersHelper) at the real url.
+jqf "(i) ~/.claude.json github MCP override uses our headersHelper" \
+  "$CLAUDE_JSON" '.mcpServers.github.headersHelper | test("mcp-github-headers.sh")'
+jqf "(i) github MCP override points at the GitHub MCP url" \
+  "$CLAUDE_JSON" '.mcpServers.github.url | test("api.githubcopilot.com")'
+# (i) the guard matcher (both global + per-folder) covers the override namespace too.
+jqf "(i) global PreToolUse matcher covers mcp__github__" \
+  "$GS" 'any(.hooks.PreToolUse[]; .matcher | test("mcp__github__"))'
+jqf "(i) settings.local.json matcher covers mcp__github__" \
+  "$SL" '.hooks.PreToolUse[0].matcher | test("mcp__github__")'
 
 # ===========================================================================
 # Task 6: osxkeychain opt-in hardening + uninstall.sh.
@@ -216,6 +236,10 @@ grep -F "gitdir/i:$TMP/folder-b/" "$GITCONFIG" >/dev/null 2>&1; [ "$?" != 0 ]; o
 [ ! -f "$SL" ]; ok "(g) folder-a settings.local.json removed" $?
 [ ! -f "$TMP/folder-b/.claude/settings.local.json" ]; ok "(g) folder-b settings.local.json removed" $?
 
+# (g) uninstall removed OUR github MCP override from ~/.claude.json.
+gj="$(jq -r '.mcpServers.github // "absent"' "$CLAUDE_JSON" 2>/dev/null || echo absent)"
+[ "$gj" = "absent" ]; ok "(g) github MCP override removed by uninstall" $?
+
 # (g) global ~/.claude/settings.json no longer wires the guard or session-init.
 jqf "(g) global SessionStart no longer runs session-init" \
   "$GS" '[.hooks.SessionStart[]? | select((.hooks // [])[]?.command | test("identity-session-init.sh"))] | length == 0'
@@ -241,5 +265,82 @@ printf '%s\n' "$TMP/folder-a" "account-a" "Account A2" "a2@users.noreply.github.
   | bash "$INSTALL" --non-interactive-from-stdin >/dev/null 2>&1
 bash "$UNINSTALL" --non-interactive --purge >/dev/null 2>&1
 [ ! -f "$GC" ]; ok "(h) --purge removes the per-account gitconfig" $?
+
+# (i) --no-mcp-override must NOT wire the github MCP override (start from clean ~/.claude.json).
+rm -f "$CLAUDE_JSON"
+printf '%s\n' "$TMP/folder-a" "account-a" "Account A2" "a2@users.noreply.github.com" "" \
+  | bash "$INSTALL" --non-interactive-from-stdin --no-mcp-override >/dev/null 2>&1
+gj="$(jq -r '.mcpServers.github // "absent"' "$CLAUDE_JSON" 2>/dev/null || echo absent)"
+[ "$gj" = "absent" ]; ok "(i) --no-mcp-override skips the MCP override" $?
+
+# (j) UPGRADE path: a pre-existing guard entry with a STALE matcher (pre-dating the
+# mcp__github__ namespace) must be REFRESHED, not left as-is — otherwise an upgrade
+# would silently leave the override namespace unguarded. Unrelated user hooks survive.
+mkdir -p "$TMP/.claude"
+cat > "$GS" <<EOF
+{ "hooks": { "PreToolUse": [
+  { "matcher": "Bash|mcp__plugin_github_github__.*",
+    "hooks": [ { "type": "command", "command": "bash $TMP/.claude/hooks/identity-guard.sh", "timeout": 15 } ] },
+  { "matcher": "Write",
+    "hooks": [ { "type": "command", "command": "bash /some/other/user-hook.sh" } ] }
+] } }
+EOF
+printf '%s\n' "$TMP/folder-a" "account-a" "Account A2" "a2@users.noreply.github.com" "" \
+  | bash "$INSTALL" --non-interactive-from-stdin --no-mcp-override >/dev/null 2>&1
+jqf "(j) upgrade refreshes the guard matcher to cover mcp__github__" \
+  "$GS" 'any(.hooks.PreToolUse[]; (.hooks[0].command | test("identity-guard.sh")) and (.matcher | test("mcp__github__")))'
+jqf "(j) upgrade keeps exactly one guard entry" \
+  "$GS" '[.hooks.PreToolUse[] | select(.hooks[0].command | test("identity-guard.sh"))] | length == 1'
+jqf "(j) upgrade preserves the unrelated user hook" \
+  "$GS" 'any(.hooks.PreToolUse[]; .matcher == "Write")'
+
+# (k) NON-DESTRUCTIVE per-folder settings.local.json: a pre-existing user key (a
+# permissions allowlist + an unrelated hook) must survive install AND uninstall —
+# install MERGES our keys, uninstall SURGICALLY removes only ours and keeps the file.
+PF="$TMP/folder-pre"; mkdir -p "$PF/.claude"
+cat > "$PF/.claude/settings.local.json" <<'EOF'
+{ "permissions": { "allow": ["Bash(ls *)", "Bash(cat *)"] },
+  "hooks": { "PreToolUse": [ { "matcher": "Write", "hooks": [ { "type":"command", "command":"bash /user/own-hook.sh" } ] } ] } }
+EOF
+printf '%s\n' "$PF" "account-a" "Account A" "a@users.noreply.github.com" "" \
+  | bash "$INSTALL" --non-interactive-from-stdin --no-mcp-override >/dev/null 2>&1
+PSL="$PF/.claude/settings.local.json"
+jqf "(k) install preserves the user's permissions allowlist" \
+  "$PSL" '.permissions.allow | index("Bash(ls *)") != null'
+jqf "(k) install preserves the user's unrelated PreToolUse hook" \
+  "$PSL" 'any(.hooks.PreToolUse[]; .matcher=="Write")'
+jqf "(k) install added our guard entry (mcp__github__ matcher)" \
+  "$PSL" 'any(.hooks.PreToolUse[]; (.hooks[0].command|test("identity-guard.sh")) and (.matcher|test("mcp__github__")))'
+jqf "(k) install added our env pin GH_TOKEN" \
+  "$PSL" '.env.GH_TOKEN=="TOKEN_A"'
+bash "$UNINSTALL" --non-interactive >/dev/null 2>&1
+jqf "(k) uninstall preserves the user's permissions allowlist" \
+  "$PSL" '.permissions.allow | index("Bash(ls *)") != null'
+jqf "(k) uninstall preserves the user's unrelated hook" \
+  "$PSL" 'any(.hooks.PreToolUse[]; .matcher=="Write")'
+jqf "(k) uninstall removed our guard entry" \
+  "$PSL" '[.hooks.PreToolUse[] | select(.hooks[0].command | test("identity-guard.sh"))] | length==0'
+jqf "(k) uninstall removed our env pins" \
+  "$PSL" '(.env.GH_TOKEN // "gone")=="gone"'
+
+# (l) install GENERATES a managed canonical CLAUDE.md per locked folder, handle-substituted,
+# non-destructive (never clobbers a hand-written one), and uninstall removes only the managed one.
+LF="$TMP/folder-cm"; mkdir -p "$LF"
+printf '%s\n' "$LF" "account-a" "Account A" "a@users.noreply.github.com" "" \
+  | bash "$INSTALL" --non-interactive-from-stdin --no-mcp-override >/dev/null 2>&1
+LCM="$LF/CLAUDE.md"
+grepf "(l) install creates a managed CLAUDE.md" "$LCM" "managed by git-identity-guard"
+grepf "(l) CLAUDE.md names the account handle" "$LCM" "account-a"
+{ [ -f "$LCM" ] && ! grep -q '__ACCT__' "$LCM"; }; ok "(l) no unsubstituted placeholder remains" $?
+# non-destructive: a hand-written CLAUDE.md (no marker) is preserved unchanged.
+UF="$TMP/folder-usercm"; mkdir -p "$UF"; printf '# my own contract\n' > "$UF/CLAUDE.md"
+printf '%s\n' "$UF" "account-a" "Account A" "a@users.noreply.github.com" "" \
+  | bash "$INSTALL" --non-interactive-from-stdin --no-mcp-override >/dev/null 2>&1
+grepf "(l) hand-written CLAUDE.md is NOT clobbered" "$UF/CLAUDE.md" "my own contract"
+{ [ "$(grep -c 'managed by git-identity-guard' "$UF/CLAUDE.md" 2>/dev/null)" = 0 ]; }; ok "(l) hand-written CLAUDE.md left unmanaged" $?
+# uninstall removes our managed CLAUDE.md, preserves the hand-written one.
+bash "$UNINSTALL" --non-interactive >/dev/null 2>&1
+{ [ ! -f "$LCM" ]; }; ok "(l) uninstall removed the managed CLAUDE.md" $?
+grepf "(l) uninstall preserved the hand-written CLAUDE.md" "$UF/CLAUDE.md" "my own contract"
 
 echo "=== $pass passed, $fail failed ==="; [ "$fail" = 0 ]
