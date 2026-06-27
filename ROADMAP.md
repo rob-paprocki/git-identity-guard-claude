@@ -21,6 +21,26 @@ out of v1.
   (`mcp__plugin_github_github__*` → `mcp__github__*`); `install.sh --no-mcp-override`
   skips it.
 
+## Known bug (priority to patch)
+
+- **A sub-directory launch can commit under the wrong author when the locked account's token is
+  unavailable.** In `identity-session-init.sh`, the env-file lines that pin the git author/committer
+  (the `printf 'export GIT_AUTHOR_…'` / `GIT_COMMITTER_…` block) sit INSIDE the
+  `if [ -n "$tok" ] && [ -n "$CLAUDE_ENV_FILE" ]` guard, where `tok="$(gh auth token --user "$LOCKED")"`.
+  If that token is empty (the locked account is not logged into `gh` in this session, or `gh` is
+  unavailable), the whole block is skipped and the **author pin is never written** — even though it needs
+  only the already-resolved `$NAME` / `$EMAIL`, not the token. The session then inherits the launching
+  shell's author identity, so commits are authored under an ambient/foreign identity while *push* still
+  succeeds (the credential helper is independent of commit author). Observed in the wild (2026-06): a
+  worktree launch authored ~21 commits in a locked repo under an unrelated project's bot identity, which
+  reached the remote looking otherwise normal and was invisible in the session transcript (ambient env,
+  never a typed command). The sub-directory fallback note also wrongly says "commit author **still**
+  [pinned]."
+  **Fix:** decouple — when `CLAUDE_ENV_FILE` is set, ALWAYS write the author/committer exports from the
+  resolved `$NAME` / `$EMAIL`; gate ONLY the token exports (`GH_TOKEN` /
+  `GITHUB_PERSONAL_ACCESS_TOKEN`) on `$tok`. Add an `unset` of inherited author/committer vars as defense,
+  correct the fallback note, and add a "no-token sub-dir launch still pins the commit author" test.
+
 ## Candidate future work
 
 - **Mid-session `cd` re-pinning (CwdChanged)** — re-resolve and re-pin `gh`/MCP when
