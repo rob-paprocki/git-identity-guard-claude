@@ -7,8 +7,12 @@ resolve_account() {
   cwd_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   cfg="${IDENTITY_LOCK_CONFIG:-$HOME/.config/identity-lock/folders.json}"
   [ -f "$cfg" ] || return 0
+  # Normalize trailing slashes on BOTH sides: a folders.json path written as "/foo/" must still
+  # match cwd "/foo" (and "/foo/sub") — otherwise the lock silently resolves to nothing and the
+  # guard fail-OPENs (allows everything) for that tree.
   jq -r --arg c "$cwd_lc" '
-    .[] | (.path | ascii_downcase) as $p
-    | select($c == $p or ($c | startswith($p + "/")))
+    ($c | sub("/+$";"")) as $cc
+    | .[] | (.path | ascii_downcase | sub("/+$";"")) as $p
+    | select($cc == $p or ($cc | startswith($p + "/")))
     | [.account, .email, .name] | @tsv' "$cfg" 2>/dev/null | head -1
 }

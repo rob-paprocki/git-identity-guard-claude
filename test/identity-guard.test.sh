@@ -240,6 +240,45 @@ ok "git -C ../escape -> DENY"                  DENY Bash "git -C ../other commit
 ok "git -C in-tree abs -> ALLOW"               ALLOW Bash "git -C $A/repo status" "$A"
 ok "git -C relative subdir -> ALLOW"           ALLOW Bash "git -C subdir status" "$A"
 ok "git -C ./sub -> ALLOW"                     ALLOW Bash "git -C ./sub log --oneline" "$A"
+# ./-prefixed escapes must NOT slip past the leading-../ anchor (the fixed evasion):
+ok "git -C ./../escape -> DENY"                DENY Bash "git -C ./../other commit -m y" "$A"
+ok "git --git-dir=./../escape -> DENY"         DENY Bash "git --git-dir=./../x/.git commit -m y" "$A"
+ok "git -C ././../escape -> DENY"              DENY Bash "git -C ././../other status" "$A"
+ok "git -C ./sub/inner in-tree -> ALLOW"       ALLOW Bash "git -C ./sub/inner status" "$A"
+# escape via a MID-token .. (not just leading), the home dir, or a two-space flag form:
+ok "git -C mid-token .. escape -> DENY"        DENY Bash "git -C foo/../../etc commit -m y" "$A"
+ok "git -C ~ home escape -> DENY"              DENY Bash "git -C ~/evil status" "$A"
+ok "git --git-dir two-space -> DENY"           DENY Bash "git --git-dir  /tmp/x/.git status" "$A"
+# the -C rule is scoped to git IN-SEGMENT: a non-git tool's -C is NOT our concern, even when the
+# command also runs git elsewhere, or a path merely contains the substring "git".
+ok "make -C (non-git) -> ALLOW"                ALLOW Bash "make -C /tmp/build all" "$A"
+ok "tar -C (non-git) -> ALLOW"                 ALLOW Bash "tar -C /opt -xzf p.tgz" "$A"
+ok "git then make -C compound -> ALLOW"        ALLOW Bash "git log --oneline && make -C /tmp/build all" "$A"
+ok "tar -C /var/git substring -> ALLOW"        ALLOW Bash "tar -C /var/git/data -xzf a.tar" "$A"
+# bash line-continuation joins these into one git invocation; must still be caught (grep is per-line):
+ok "git -C continuation escape -> DENY"        DENY Bash $'git \\\n-C /tmp/other log' "$A"
+ok "git --git-dir continuation escape -> DENY" DENY Bash $'git --git-dir \\\n/tmp/x/.git status' "$A"
+# a BARE newline (no backslash) is a real separator: the second command's -C must NOT be joined to git:
+ok "bare-newline make -C -> ALLOW"             ALLOW Bash $'git status\nmake -C /tmp/build all' "$A"
+
+# ---- git remote add/set-url to an SSH/scp remote (would route pushes off the HTTPS pin) ----
+ok "git remote set-url ssh git@ -> DENY"       DENY Bash "git remote set-url origin git@github.com:foo/bar.git" "$A"
+ok "git remote add ssh:// -> DENY"             DENY Bash "git remote add up ssh://git@github.com/foo/bar" "$A"
+ok "git remote set-url scp-style -> DENY"      DENY Bash "git remote set-url origin github.com:foo/bar.git" "$A"
+ok "git remote add dotless-host scp -> DENY"   DENY Bash "git remote add origin server:repo.git" "$A"
+ok "git remote add IP-host scp -> DENY"        DENY Bash "git remote add origin 10.0.0.1:repo.git" "$A"
+ok "git remote set-url abs-path scp -> DENY"   DENY Bash "git remote set-url origin host.com:/srv/r.git" "$A"
+ok "git remote add https -> ALLOW"             ALLOW Bash "git remote add origin https://github.com/foo/bar.git" "$A"
+ok "git remote add https userinfo -> ALLOW"    ALLOW Bash "git remote add origin https://git@github.com/foo/bar.git" "$A"
+ok "git remote add https :port -> ALLOW"       ALLOW Bash "git remote add origin https://github.com:443/foo/bar.git" "$A"
+ok "git remote -v read -> ALLOW"               ALLOW Bash "git remote -v" "$A"
+ok "git remote rename (no url) -> ALLOW"       ALLOW Bash "git remote rename origin upstream" "$A"
+# tight gate: a stray 'add' word (commit msg) while merely READING remotes is NOT a remote mutation:
+ok "remote read + 'add' in msg -> ALLOW"       ALLOW Bash "git remote -v && git commit -m \"add dep com.x:1.0\"" "$A"
+# segment-scoped detection: a legit https remote add chained with a colon-bearing script is NOT denied:
+ok "remote add https && build:prod -> ALLOW"   ALLOW Bash "git remote add origin https://github.com/o/r.git && npm run build:prod" "$A"
+# ...but a line-continuation between the subcommand and an ssh URL is still ONE command -> DENY:
+ok "remote add continuation ssh -> DENY"       DENY Bash $'git remote add origin \\\ngit@evil.com:repo.git' "$A"
 
 # ---- author forge (git am / --reuse-message) ----
 ok "git am forged From -> DENY"                DENY Bash "git am 0001-evil.patch" "$A"

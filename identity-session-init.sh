@@ -21,9 +21,10 @@ IFS=$'\t' read -r LOCKED EMAIL NAME < <(resolve_account "$cwd")
 # session is at the folder root or in a sub-directory.
 IDLOCK_CFG="${IDENTITY_LOCK_CONFIG:-$HOME/.config/identity-lock/folders.json}"
 ROOT="$(jq -r --arg c "$cwd_lc" '
-  .[] | (.path | ascii_downcase) as $p
-  | select($c == $p or ($c | startswith($p + "/")))
-  | .path' "$IDLOCK_CFG" 2>/dev/null | head -1)"
+  ($c | sub("/+$";"")) as $cc
+  | .[] | (.path | ascii_downcase | sub("/+$";"")) as $p
+  | select($cc == $p or ($cc | startswith($p + "/")))
+  | (.path | sub("/+$";""))' "$IDLOCK_CFG" 2>/dev/null | head -1)"
 ROOT_LC="$(printf '%s' "$ROOT" | tr '[:upper:]' '[:lower:]')"
 
 # --- per-session identity pin: make gh / git / MCP work from SUB-DIRECTORIES ---
