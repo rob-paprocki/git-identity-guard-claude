@@ -21,27 +21,35 @@ out of v1.
   (`mcp__plugin_github_github__*` → `mcp__github__*`); `install.sh --no-mcp-override`
   skips it.
 
-## Known bug (priority to patch)
-
-- **A sub-directory launch can commit under the wrong author when the locked account's token is
-  unavailable.** In `identity-session-init.sh`, the env-file lines that pin the git author/committer
-  (the `printf 'export GIT_AUTHOR_…'` / `GIT_COMMITTER_…` block) sit INSIDE the
-  `if [ -n "$tok" ] && [ -n "$CLAUDE_ENV_FILE" ]` guard, where `tok="$(gh auth token --user "$LOCKED")"`.
-  If that token is empty (the locked account is not logged into `gh` in this session, or `gh` is
-  unavailable), the whole block is skipped and the **author pin is never written** — even though it needs
-  only the already-resolved `$NAME` / `$EMAIL`, not the token. The session then inherits the launching
-  shell's author identity, so commits are authored under an ambient/foreign identity while *push* still
-  succeeds (the credential helper is independent of commit author). Observed in the wild (2026-06): a
-  worktree launch authored ~21 commits in a locked repo under an unrelated project's bot identity, which
-  reached the remote looking otherwise normal and was invisible in the session transcript (ambient env,
-  never a typed command). The sub-directory fallback note also wrongly says "commit author **still**
-  [pinned]."
-  **Fix:** decouple — when `CLAUDE_ENV_FILE` is set, ALWAYS write the author/committer exports from the
-  resolved `$NAME` / `$EMAIL`; gate ONLY the token exports (`GH_TOKEN` /
-  `GITHUB_PERSONAL_ACCESS_TOKEN`) on `$tok`. Add an `unset` of inherited author/committer vars as defense,
-  correct the fallback note, and add a "no-token sub-dir launch still pins the commit author" test.
+- **Sub-directory author-pin leak fixed (priority patch, 2026-06).** A worktree / sub-directory
+  launch in a locked repo used to commit under the wrong author when the locked account's token was
+  unavailable: the git author/committer exports lived inside the
+  `if [ -n "$tok" ] && [ -n "$CLAUDE_ENV_FILE" ]` token gate in `identity-session-init.sh`, so an
+  empty `$tok` skipped the whole block and the session inherited the launching shell's ambient
+  `GIT_AUTHOR_*`/`GIT_COMMITTER_*` — while push still worked (credential helper is independent of
+  commit author). Observed in the wild: ~21 commits authored under an unrelated project's bot identity,
+  invisible in the transcript (ambient env, never a typed command). **Fix:** the author/committer pin is
+  written **unconditionally** (token-independent; needs only `$NAME`/`$EMAIL`) under its **own**
+  idempotency marker, inherited ambient author/committer is `unset` first, the gh/MCP token pin **and**
+  the session pin file stay gated on `$tok` (so the guard never green-lights unpinned gh/MCP), both
+  markers are **account-scoped** (a re-fire resolving a different account re-pins author + token + pin
+  file together rather than trusting a stale account), and the sub-directory note is honest in every path
+  (push is only claimed pinned when the token the push credential helper needs is present). Regressions in
+  `test/session-init.test.sh` (4b/4c/4d/5b); applied to the root scripts and the byte-identical
+  `plugin/scripts/` copies.
 
 ## Candidate future work
+
+- **Guard commit-author backstop.** The guard (`identity-guard.sh`) only fail-closes `gh`/MCP; it never
+  gates `git commit` and assumes the includeIf `[user]` pin keeps the author correct. Git env vars
+  (`GIT_AUTHOR_*`/`GIT_COMMITTER_*`) override gitconfig `user.*`, so if the env-file author pin ever
+  fails to apply, an ambient author silently wins and the guard provides no backstop (and its messages
+  still say "commit author stays pinned"). Consider a deny rule / warning when committing in a locked
+  tree without a verified locked author, and align the guard's reassurance messages with reality.
+  (The env-file/pin-file markers are now account-scoped, but the guard still does not gate `git commit`.)
+- **Most-specific nested-folder resolution.** `resolve_account` (and the ROOT lookups) take `head -1`
+  over unordered `jq` output, so for nested locks a cwd can bind to whichever entry `folders.json` lists
+  first rather than the deepest matching `.path`. Order matches by path-specificity (longest path wins).
 
 - **Mid-session `cd` re-pinning (CwdChanged)** — re-resolve and re-pin `gh`/MCP when
   the working directory moves *between* locked trees within a single session. Today

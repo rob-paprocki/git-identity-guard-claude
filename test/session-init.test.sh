@@ -97,9 +97,60 @@ EF2="$TMP/envfile2.sh"; : > "$EF2"
 runp "$C/repo" "sid-ccc" "$EF2"
 t "no env pin when account token unavailable" bash -c '! grep -q "export GH_TOKEN=" "$1"' _ "$EF2"
 t "no pin file when account token unavailable" bash -c '[ ! -f "$1" ]' _ "$IDENTITY_LOCK_SESSIONS/sid-ccc"
+# (4b) PRIORITY-PATCH regression (2026-06): a no-token sub-dir launch (account-c) MUST STILL
+# pin the commit author/committer — that pin is token-INDEPENDENT. Before the fix the author
+# exports lived inside the token gate, so this path inherited the launching shell's ambient
+# GIT_AUTHOR_* and authored commits under a FOREIGN identity while push still worked. ($EF2
+# was written by the account-c run above.)
+t "no-token launch STILL pins author email"           grep -q '^export GIT_AUTHOR_EMAIL=' "$EF2"
+t "no-token launch STILL pins author name"            grep -q '^export GIT_AUTHOR_NAME='  "$EF2"
+t "no-token launch STILL pins committer name"         grep -q '^export GIT_COMMITTER_NAME=' "$EF2"
+t "no-token launch STILL pins committer email"        grep -q '^export GIT_COMMITTER_EMAIL=' "$EF2"
+t "no-token launch clears ambient author first"       grep -q '^unset GIT_AUTHOR_NAME ' "$EF2"
+t "no-token author pin uses the LOCKED account email" grep -q 'export GIT_AUTHOR_EMAIL=.*c@users[.]noreply' "$EF2"
+# idempotent: re-running the no-token launch does not duplicate the author exports.
+runp "$C/repo" "sid-ccc" "$EF2"
+t "no-token author email pinned exactly once" bash -c '[ "$(grep -c "^export GIT_AUTHOR_EMAIL=" "$1")" = 1 ]' _ "$EF2"
+# the sub-dir note for this path must say commit author IS pinned, but crucially must NOT claim
+# push is pinned (the old note lumped author+push together, yet push needs the same token).
+ctxC="$(jq -n --arg c "$C/repo" --arg s "sid-ccc2" '{cwd:$c,session_id:$s}' | CLAUDE_ENV_FILE="$TMP/envfileC.sh" bash "$INIT" 2>/dev/null)"
+t "no-token note: commit author IS pinned to the account" \
+  bash -c 'printf "%s" "$1" | jq -e ".hookSpecificOutput.additionalContext | test(\"commit author is pinned to account-c\")" >/dev/null' _ "$ctxC"
+t "no-token note: git push is NOT claimed pinned" \
+  bash -c 'printf "%s" "$1" | jq -e ".hookSpecificOutput.additionalContext | test(\"git push are NOT pinned\")" >/dev/null' _ "$ctxC"
+
+# (4c) Two INDEPENDENT markers (guards the split-marker regression): an env-file that already
+# carries ONLY the author marker (a prior no-token fire) must NOT suppress the gh token pin on
+# a later token-available fire, and must not re-run the author block.
+EF4="$TMP/envfile4.sh"
+printf '# identity-lock author pin OK account-a\n' > "$EF4"   # simulate a prior author-only pin
+runp "$A/sub/deep" "sid-trans" "$EF4"
+t "author marker present does NOT suppress the gh token pin" grep -q 'export GH_TOKEN=.*TOKEN_A' "$EF4"
+t "author block idempotent (marker not duplicated)" bash -c '[ "$(grep -c "identity-lock author pin OK" "$1")" = 1 ]' _ "$EF4"
+
+# (4d) Cross-account re-fire on a REUSED env-file: a resume that resolves a DIFFERENT locked
+# account must RE-PIN author + token + pin file to the NEW account (account-scoped markers),
+# never leave the previous account's identity in place. Fails on account-agnostic markers.
+EF5="$TMP/envfile5.sh"; : > "$EF5"
+runp "$A/sub" "sid-xacct" "$EF5"     # first fire: pin account-a
+runp "$B/sub" "sid-xacct" "$EF5"     # re-fire resolves account-b on the SAME env-file
+t "x-account: env-file re-pins author to account-b" grep -q 'export GIT_AUTHOR_EMAIL=.*b@users' "$EF5"
+t "x-account: env-file re-pins token to TOKEN_B"     grep -q 'export GH_TOKEN=.*TOKEN_B' "$EF5"
+t "x-account: pin file now reads account-b"          bash -c '[ "$(cat "$1" 2>/dev/null)" = account-b ]' _ "$IDENTITY_LOCK_SESSIONS/sid-xacct"
+# sourced top-to-bottom, the LAST (account-b) writes must win for BOTH author and token:
+t "x-account: sourced env-file authors as account-b" \
+  bash -c 'e="$(. "$1" >/dev/null 2>&1; printf "%s" "$GIT_AUTHOR_EMAIL")"; case "$e" in b@*) exit 0;; *) exit 1;; esac' _ "$EF5"
+t "x-account: sourced env-file token is account-b" \
+  bash -c 'k="$(. "$1" >/dev/null 2>&1; printf "%s" "$GH_TOKEN")"; [ "$k" = TOKEN_B ]' _ "$EF5"
+
 # (5) no CLAUDE_ENV_FILE (e.g. a resume path) -> no pin file (can't verify the pin).
 jq -n --arg c "$A/sub" --arg s "sid-nofile" '{cwd:$c,session_id:$s}' | env -u CLAUDE_ENV_FILE bash "$INIT" >/dev/null 2>&1
 t "no pin file when CLAUDE_ENV_FILE is absent" bash -c '[ ! -f "$1" ]' _ "$IDENTITY_LOCK_SESSIONS/sid-nofile"
+# (5b) ...and with no writable env-file the author pin cannot be applied, so the sub-dir note
+# must HONESTLY warn that commit author is NOT guaranteed (not claim it is still pinned).
+ctxNF="$(jq -n --arg c "$A/sub" --arg s "sid-nofile2" '{cwd:$c,session_id:$s}' | env -u CLAUDE_ENV_FILE bash "$INIT" 2>/dev/null)"
+t "no-env-file sub-dir note warns commit author NOT guaranteed" \
+  bash -c 'printf "%s" "$1" | jq -e ".hookSpecificOutput.additionalContext | test(\"NOT guaranteed\")" >/dev/null' _ "$ctxNF"
 # (6) the additionalContext for a pinned sub-dir reflects that gh/MCP are pinned here.
 EF3="$TMP/envfile3.sh"; : > "$EF3"
 ctxout="$(jq -n --arg c "$A/sub" --arg s "sid-ctx" '{cwd:$c,session_id:$s}' | CLAUDE_ENV_FILE="$EF3" bash "$INIT" 2>/dev/null)"
