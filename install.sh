@@ -80,10 +80,13 @@ ask()  { # ask <var> <prompt> [default]; in scripted mode reads a bare line from
   printf -v "$__var" '%s' "$__reply"
 }
 
-# The PreToolUse matcher used by both the per-folder and the global wiring. Covers
-# the GitHub plugin's MCP namespace AND the user-scoped override's (mcp__github__*),
-# so the guard fires regardless of whether the MCP override is enabled.
-GUARD_MATCHER='Bash|mcp__plugin_github_github__.*|mcp__github__.*'
+# The PreToolUse matcher used by both the per-folder and the global wiring. Covers the GitHub plugin's
+# MCP namespace, the user-scoped override's (mcp__github__*), AND any other github MCP server namespace
+# (mcp__…github…__*, e.g. GitHub Enterprise or a copilot server) so the guard FIRES for those too — the
+# guard then token-checks their writes instead of letting them through unguarded (the M3 fail-open). The
+# two explicit literals are kept first for clarity (and back-compat with installs/tests that match them).
+# NOTE: pre-existing installs must RE-RUN install.sh to widen an older matcher to the github-substring form.
+GUARD_MATCHER='Bash|mcp__plugin_github_github__.*|mcp__github__.*|mcp__[A-Za-z0-9_]*github[A-Za-z0-9_]*__.*'
 
 # Opt-in osxkeychain hardening. We erase any stored github.com credential so a
 # push from a locked folder cannot silently fall back to a cached (wrong-account)

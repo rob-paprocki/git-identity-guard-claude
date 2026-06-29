@@ -175,11 +175,16 @@ It is **not a sandbox.** A command that already has arbitrary code execution can
 still defeat pinning, because there is an irreducible floor a command-string hook
 cannot reach:
 
-- **shell quote-splitting** of a command or flag, so the literal substring the
-  guard scans for never appears (e.g. splitting `git`, `--author`, or
-  `credential.helper` across quotes);
-- an **interpreter building a flag or variable name** dynamically, with no
-  literal substring to match;
+- **shell quote-splitting of a command or flag name** (e.g. `gi""t`, splitting
+  `--author` across quotes), so the deny filter's literal substring never appears.
+  This is benign for *identity*: however `git`/`gh` is spelled it still runs as the
+  locked account by DEFAULT (env + gitconfig pin), and author/committer are env-pinned
+  regardless. (Note: quote/backslash/brace/`$`-splitting of a pinned **variable
+  name** in an assignment — `GH""_TOKEN`, `GH\_TOKEN`, `GH{A,_}TOKEN`, `${v}` — is
+  NOT residual; it is explicitly caught by the deny rules.)
+- an **interpreter building a flag or variable name** at runtime (e.g. a compiled
+  binary, or a script assembling the name from arithmetic), with no literal
+  substring in the command string to match;
 - writing a **persistent shell-startup file** that re-points identity for future
   shells.
 

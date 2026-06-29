@@ -59,20 +59,55 @@ out of v1.
   inside quotes are the documented quote-blindness floor (the last errs toward over-blocking, never a
   bypass).
 
+- **Red-team hardening pass (2026-06, second multi-agent review + hand-verification).** A multi-agent red
+  team plus empirical re-verification (every finding run against the real guard, with paired controls) found
+  and FIXED a batch of bypasses and false-positives. **HIGH:** (H1) the guard's own policy files
+  (`~/.config/identity-lock/`, `~/.claude/hooks/`) were unprotected — `rm`/clobbering them fail-OPENed the
+  whole guard; now write/delete-protected (rule 7b). (H2/H8) an assignment NAME obfuscated by brace
+  expansion, quote-splitting, or backslash (`export GH{A,_}TOKEN=`, `GH""_TOKEN`, `GH\_TOKEN`,
+  `GIT_AUTHOR""_NAME`, also `read`/`printf -v`/`mapfile` targets) rebuilt a pinned var with no literal
+  substring and no `$` — now caught (rule 1d). (H5) the `gh api` Authorization-header deny was effectively
+  case-sensitive and adjacency-bound (`-H 'AUTHORIZATION:'`, `gh --verbose api`) — now case-insensitive,
+  flags allowed. (H6) `git send-pack` (push plumbing, no "push" word) bypassed all of rule 6 — now in scope.
+  (H7) scp push to a dotless host / IP / 1-char TLD evaded the dotted-host regex — now uses the rule-6b
+  detector. (H3/H4) session-init trusted marker PRESENCE as proof of pinning, so a forged marker comment, or
+  an A→B→A account return-hop, left a foreign author winning while the pin file claimed the locked account —
+  the env-file pin is now strip-then-reappend (current account always wins, state derived from the actual
+  write, never a marker). **MEDIUM:** (M2) the MCP write-classifier was a verb-allowlist that missed
+  `assign_/mark_/dismiss_/manage_/run_secret_scanning` writes — inverted to a read-allowlist (default-deny);
+  (M3) a non-standard github MCP namespace (Enterprise/copilot) skipped the guard entirely — matcher + case
+  widened to `mcp__…github…__*`; (M4) `command/builtin/time/VAR= source` evaded the source deny — anchored;
+  (M6) `gh auth setup-git` (writes a credential helper) is denied, and `gh auth switch/refresh` fail-closed
+  in an unpinned tree. **Fixed false-positives** that were pushing users to disable the guard: bare `ENV`
+  over-blocked `make ENV=prod`/`docker -e ENV=` (M5, dropped from the var list); rule 6 wasn't segment-scoped
+  so a `host:port` token in a later segment wrongly denied a legit push (L6); the `-C` in-tree exception
+  spliced the lock ROOT into a regex unescaped, so a dotted lock path mis-matched a sibling (L1, now escaped);
+  single-userinfo / uppercase-scheme push URLs (L4/L5); and a stale baked MCP token wrongly denied
+  override-namespace writes after `gh auth refresh` (L3, the override connection uses the live headersHelper
+  token). Regressions: `test/identity-guard.test.sh` (+62), `test/session-init.test.sh` (+10),
+  `test/install.test.sh` (+1); independently re-verified via `verification/`. Applied to the root scripts and
+  the byte-identical `plugin/scripts/` copies (+ `plugin/hooks/hooks.json` matcher). **Accepted residuals:**
+  `cd <outside-tree> && git push` (a string hook can't pin an arbitrary outside repo — documented); `..`-path
+  lexical over-pin in `resolve_account` (L2 — over-pin, not a bypass; cwd isn't agent-forgeable).
+
 ## Known issues (pre-existing — found in the 2026-06 adversarial review)
 
 The three HIGH issues from that review are now fixed (see "Shipped since v1" above). These lower-severity
 ones remain, independent of the author-pin fix:
 
-- **(medium) Guard matcher only covers `Bash` + the github MCP tools.** Other shell-exec MCP tools (e.g.
-  a `*__execute_shell_command`, `osascript`) run git/gh unguarded and outside the env pin. Fix: widen the
-  matcher or document the exposure.
-- **(low) Session pin file is an unauthenticated, agent-writable trust anchor.** Any Bash command can
-  forge `~/.config/identity-lock/sessions/<sid>` to flip a sub-dir gh/MCP DENY to ALLOW. Fix: store it
-  outside agent-writable space, or sign it, or have the guard re-verify the token rather than trust the file.
+- **(medium) Guard matcher only covers `Bash` + the github MCP tools.** Other *non-github* shell-exec MCP
+  tools (e.g. a `*__execute_shell_command`, `osascript`) run git/gh unguarded and outside the env pin. Fix:
+  widen the matcher or document the exposure. (The 2026-06 hardening DID widen the matcher to cover other
+  *github* MCP namespaces — M3 — but a generic shell-exec MCP tool is a distinct, still-open exposure.)
+- **(low, partially mitigated) Session pin file is an agent-writable trust anchor.** The 2026-06 rule 7b now
+  blocks writes/deletes to `~/.config/identity-lock/` (incl. `sessions/<sid>`) and `~/.claude/hooks/` from a
+  **Bash** command in a locked tree, so the common forge-via-Bash path is closed. It is NOT a hard boundary:
+  a non-Bash channel (an unguarded MCP shell-exec tool, a compiled binary) could still write the file. Fix
+  for full coverage: store it outside agent-writable space, sign it, or have the guard re-verify the token.
 - **(nit) `$account` is interpolated unquoted into the generated credential-helper snippet** (`install.sh`)
-  — a malformed/hostile account string becomes shell that git runs on every push. Fix: validate the handle
-  shape and quote it.
+  — a malformed/hostile account string becomes shell that git runs on every push. STILL OPEN. Fix: validate
+  the handle shape and quote it. (Low risk: `$account` comes from the operator's own install input, not an
+  agent; but worth hardening.)
 
 ## Candidate future work
 
