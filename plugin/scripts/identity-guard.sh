@@ -54,9 +54,10 @@ IFS=$'\t' read -r LOCKED EMAIL NAME < <(resolve_account "$cwd")
 # --work-tree in-tree exception below allows only paths under this root.
 IDLOCK_CFG="${IDENTITY_LOCK_CONFIG:-$HOME/.config/identity-lock/folders.json}"
 ROOT="$(jq -r --arg c "$cwd_lc" '
-  .[] | (.path | ascii_downcase) as $p
-  | select($c == $p or ($c | startswith($p + "/")))
-  | .path' "$IDLOCK_CFG" 2>/dev/null | head -1)"
+  ($c | sub("/+$";"")) as $cc
+  | .[] | (.path | ascii_downcase | sub("/+$";"")) as $p
+  | select($cc == $p or ($cc | startswith($p + "/")))
+  | (.path | sub("/+$";""))' "$IDLOCK_CFG" 2>/dev/null | head -1)"
 ROOT_LC="$(printf '%s' "$ROOT" | tr '[:upper:]' '[:lower:]')"
 
 deny() { jq -n --arg r "$1" '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}'; exit 0; }
@@ -90,6 +91,13 @@ esac
 [ "$tool" = "Bash" ] || exit 0
 cmd="$(jqr '.tool_input.command // empty')"
 [ -z "$cmd" ] && exit 0
+# Collapse bash line-continuations (backslash immediately before a newline) into one logical line, so
+# the line-oriented greps below see what bash will actually RUN. Otherwise a continuation splits tokens
+# across grep lines while bash joins them — e.g. `git \<NL>-C /outside` or
+# `git remote add origin \<NL>git@host:repo` would evade the segment-scoped rules. Bare newlines are
+# LEFT intact: they are genuine command separators (like ';') and grep already treats them per-line.
+nl=$'\n'
+cmd="${cmd//\\$nl/}"
 has()  { printf '%s' "$cmd" | grep -Eq  -- "$1"; }
 hasi() { printf '%s' "$cmd" | grep -Eqi -- "$1"; }   # case-insensitive (git config keys / macOS paths)
 
@@ -150,10 +158,20 @@ if has '(^|[[:space:]])(--reuse-message|--reedit-message)([ =])' && ! has '\-\-r
   deny "Identity guard: 'git commit --reuse-message/--reedit-message' copies another commit's author; blocked in the $LOCKED workspace unless combined with --reset-author."
 fi
 # 'git -C' / --git-dir / --work-tree pointing OUTSIDE the locked tree: the includeIf identity and the
-# credential-helper pin only apply under the locked folder ROOT, so an outside target acts as another account.
-if has '(-C[[:space:]]+|--git-dir[ =]|--work-tree[ =])(\.\./|/)'; then
-  printf '%s' "$cmd" | grep -Eqi -- "(-C[[:space:]]+|--git-dir[ =]|--work-tree[ =])${ROOT_LC}(/|[[:space:]]|\$)" \
-    || deny "Identity guard: 'git -C/--git-dir/--work-tree' targeting a path outside the locked folder ($ROOT) is blocked (the identity pin only applies under that tree)."
+# credential-helper pin only apply under the locked folder ROOT, so an outside target acts as another
+# account. --git-dir/--work-tree are git-ONLY flags (enforced anywhere); -C is SHARED (make/tar use it),
+# so the -C form is enforced only when 'git' precedes it in the SAME command segment ([^;&|]*) — a plain
+# 'make -C /x', a 'tar -C /var/git/data', or a 'git …' chained with an unrelated 'make -C /x' is NOT
+# denied. Trigger on an absolute (/) or home (~) path, OR ANY '..' path component (leading or mid-token,
+# so ./../x, foo/../../x, ../x all count); an in-tree relative path (sub, ./sub, sub/dir) has none and
+# stays allowed. Separators accept '=' or one-or-more spaces (a two-space form can't slip past). Quoted,
+# $-expanded, or symlink paths are the documented quote-splitting / dynamic-construction residual.
+if has '\bgit\b[^;&|]*-C[[:space:]]+(/|~)' \
+   || has '\bgit\b[^;&|]*-C[[:space:]]+([^[:space:]]*/)?\.\.(/|[[:space:]]|$)' \
+   || has '(--git-dir|--work-tree)[[:space:]=]+(/|~)' \
+   || has '(--git-dir|--work-tree)[[:space:]=]+([^[:space:]]*/)?\.\.(/|[[:space:]]|$)'; then
+  printf '%s' "$cmd" | grep -Eqi -- "(-C[[:space:]]+|--git-dir[[:space:]=]+|--work-tree[[:space:]=]+)${ROOT_LC}(/|[[:space:]]|\$)" \
+    || deny "Identity guard: 'git -C/--git-dir/--work-tree' targeting a path outside the locked folder ($ROOT), or any path with a '..' component, is blocked (the identity pin only applies under that tree)."
 fi
 
 # 5) gh: explicit auth-header / hostname override, token login, logout.
@@ -174,6 +192,21 @@ if has '\bpush\b'; then
     deny "Identity guard: scp-style remote push can't be identity-pinned to $LOCKED. Use an https:// remote."
   has 'https?://[^/[:space:]]*:[^/@[:space:]]*@' && \
     deny "Identity guard: refusing a push URL with embedded credentials in the $LOCKED workspace."
+fi
+
+# 6b) git remote add / set-url to an SSH/scp remote. The credential-helper pin is HTTPS-only, so a push
+# over an SSH remote authenticates with the loaded SSH key, NOT the locked account. Refuse to CREATE such
+# a remote. Gate tightly on the 'remote add' / 'remote set-url' SUBCOMMAND (not a stray 'add' word in,
+# say, a commit message). Detect ssh:// or a scp-style host:path token. Note an scp token (host:path,
+# host:/path, user@host:path, dotless alias, or IP) has NO '://' — so https remotes, including
+# https://user@host and https://host:443, never match (the ':' there is followed by '//'). A repo CLONED
+# over SSH before the session keeps an SSH origin the guard cannot pin — see README "Threat model".
+if has '\bgit\b[^;&|]*\bremote[[:space:]]+(add|set-url)\b'; then
+  # Detect the ssh:// or scp-style URL only within the SAME segment as the subcommand ([^;&|]*), so a
+  # chained 'remote add … https://… && npm run build:prod' isn't tripped by the later 'build:prod'.
+  { has 'remote[[:space:]]+(add|set-url)[^;&|]*ssh://' \
+    || has 'remote[[:space:]]+(add|set-url)[^;&|]*[[:space:]]([A-Za-z0-9_.-]+@)?[A-Za-z0-9_.-]+:/?[^/[:space:]]'; } && \
+    deny "Identity guard: setting an SSH/scp git remote is blocked in the $LOCKED workspace — SSH pushes can't be identity-pinned to $LOCKED. Use an https:// remote."
 fi
 
 # 7) Direct writes to a git config file (redirection / tee / sed -i / cp / mv …) — bypasses 'git config'.

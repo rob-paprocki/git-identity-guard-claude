@@ -328,8 +328,11 @@ collected=0
 while :; do
   path=""
   ask path "Folder to lock (absolute path)"
-  # Trim only trailing whitespace/newline; do NOT canonicalize (exact-match config).
+  # Trim trailing whitespace/newline; do NOT canonicalize symlinks/relatives (exact-match config).
   path="${path%"${path##*[![:space:]]}"}"
+  # ...but DO strip trailing slash(es): a stored "/foo/" never matches cwd "/foo" at resolve time,
+  # silently disabling the lock (guard fail-OPEN). resolve-account also tolerates this defensively.
+  case "$path" in */) path="$(printf '%s' "$path" | sed -E 's#/+$##')" ;; esac
   [ -z "$path" ] && break
 
   account=""; name=""; email=""

@@ -192,6 +192,15 @@ An actor with arbitrary code execution can also exfiltrate data over non-git
 channels entirely. So treat this tool as **hardening that makes the common
 mistakes impossible and the deliberate bypasses obvious**, not as a jail.
 
+**Transport limit (SSH remotes).** Push pinning runs through the HTTPS credential
+helper, so it only covers `https://` remotes. A repo whose `origin` is an **SSH**
+remote (`git@…` / `ssh://…`) pushes over the loaded SSH key, which the pin cannot
+bind to the locked account. The guard refuses to *create* an SSH remote
+(`git remote add` / `set-url`) and denies inline SSH/scp push URLs, but it cannot
+re-pin a **pre-existing** SSH `origin` (a command-string hook can't bind the
+transport). Use `https://` remotes under a lock — or re-point an SSH `origin`
+with `git remote set-url origin https://…`.
+
 ### Override / strip attacks the guard targets (by name)
 
 The guard's deny rules exist specifically to block these classes, while

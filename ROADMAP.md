@@ -40,23 +40,30 @@ out of v1.
   Regressions in `test/session-init.test.sh` (4b/4c/4d/4e/5b/5c); applied to the root scripts and the
   byte-identical `plugin/scripts/` copies.
 
-## Known issues (pre-existing — found in the 2026-06 adversarial review, not yet patched)
+- **Guard & resolver hardening — 3 HIGH pre-existing bugs fixed + deny-rule robustness (2026-06,
+  four-round adversarial review).**
+  (1) **`git -C` outside-tree escapes** — the outside-tree block now catches a leading `./` (`./../x`),
+  mid-token `..` (`foo/../../x`), `~` home paths, and the two-space `--git-dir`/`--work-tree` form; it is
+  **scoped to a git invocation in the same command segment** (so `make -C /x` / `tar -C /var/git/data`,
+  or `git … && make -C /x`, are no longer wrongly denied). (2) **Trailing-slash fail-open** — a
+  `folders.json` path written as `/foo/` made the lock inert and the guard fail-OPEN; `install.sh` now
+  strips trailing slashes on input and `resolve_account` + both inline ROOT lookups normalize them on
+  either side. (3) **SSH-remote setup** — `git remote add`/`set-url` to an SSH/scp remote (incl.
+  dotless-host, IP, and absolute-path scp forms) is now denied; the detection is segment-scoped and never
+  trips on `https://` (even with userinfo or `:port`). Plus: **bash line-continuations** (`\`+newline) are
+  collapsed before the line-oriented greps so a continuation can't split a token across grep lines while
+  bash joins it (`git \⏎-C /outside`). Regressions in `test/identity-guard.test.sh` and
+  `test/resolve-account.test.sh`. **Residuals (accepted):** a repo *cloned* over SSH before the session
+  still isn't push-pinned (a command-string hook can't bind the SSH transport — re-point such an `origin`
+  to `https://`, see README "Threat model"); quoted/`$`-expanded/symlink `-C` paths and a literal `\`+LF
+  inside quotes are the documented quote-blindness floor (the last errs toward over-blocking, never a
+  bypass).
 
-These are independent of the author-pin fix above; they live in the guard / installer / resolver and
-defeat or weaken the *push* and *deny-filter* guarantees. Verified with repros.
+## Known issues (pre-existing — found in the 2026-06 adversarial review)
 
-- **(high) Bare `git push` over an SSH remote isn't pinned.** The credential-helper pin is HTTPS-only and
-  the guard only denies SSH/scp URLs that appear *inline*; an SSH-cloned `origin` (or one set via
-  `git remote set-url`, which the guard doesn't gate) makes `git push origin …` authenticate with the
-  loaded SSH key, not the locked account. Fix ideas: gate `git remote add/set-url`, and/or deny pushes
-  whose effective remote is SSH, and/or document SSH repos as unsupported under a lock.
-- **(high) `git -C ./../x` (and `--git-dir=./..`, `--work-tree=./..`) evade the outside-tree block.** The
-  detection anchors on a leading `../` or `/`; a `./` prefix slips past, letting git operate on a tree
-  outside the locked ROOT. Fix: normalize the path (or also match `./`/`.//`) before the containment test.
-- **(high) A trailing slash (or non-normalized path) in `folders.json` makes the lock inert (fail-open).**
-  `resolve_account` then matches nothing and the guard `exit 0`s (allows everything) for that tree. Fix:
-  normalize/validate paths in `install.sh` (strip trailing `/`, require absolute) and tolerate it in the
-  resolver.
+The three HIGH issues from that review are now fixed (see "Shipped since v1" above). These lower-severity
+ones remain, independent of the author-pin fix:
+
 - **(medium) Guard matcher only covers `Bash` + the github MCP tools.** Other shell-exec MCP tools (e.g.
   a `*__execute_shell_command`, `osascript`) run git/gh unguarded and outside the env pin. Fix: widen the
   matcher or document the exposure.
