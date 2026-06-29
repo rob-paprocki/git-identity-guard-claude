@@ -24,10 +24,12 @@ the token marker; any inherited ambient author/committer is `unset` first; the g
 the session pin file the guard trusts stay gated on `$tok` (so the guard never green-lights gh/MCP that
 was never pinned); both markers are **account-scoped**, so a resume/re-fire resolving a *different*
 locked account on a reused env-file re-pins (author + token + pin file together) instead of trusting a
-stale account; and the sub-directory note is now honest in every path (push is only claimed pinned when
-the token — which the push credential helper also needs — is present; otherwise "NOT guaranteed — do NOT
-commit"). Regressions: `test/session-init.test.sh` (4b/4c/4d/5b). Applies to both the root scripts and
-the byte-identical `plugin/scripts/` copies.
+stale account (the account markers are matched **whole-line** with `grep -qxF`, so a prefix-named
+account like `rob` can't substring-match `rob-paprocki`'s marker line); and the sub-directory note is now
+honest in every path (push is only claimed pinned when the token — which the push credential helper also
+needs — is present; an *unwritable* env-file warns the ambient identity is STILL ACTIVE → do NOT commit,
+rather than falsely claiming it was cleared). Regressions: `test/session-init.test.sh` (4b/4c/4d/4e/5b/5c).
+Applies to both the root scripts and the byte-identical `plugin/scripts/` copies.
 
 **Related hardening (surfaced during the fix, parked — see `ROADMAP.md` → "Candidate future work"):**
 the guard has no hard `git commit` author backstop (only fail-closes `gh`, so an ambient author still

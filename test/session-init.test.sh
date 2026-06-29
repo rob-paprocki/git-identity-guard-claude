@@ -11,16 +11,19 @@ set -u
 INIT="$(cd "$(dirname "$0")/.." && pwd)/identity-session-init.sh"
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-A="$TMP/folder-a"; B="$TMP/folder-b"; C="$TMP/folder-c"; mkdir -p "$A" "$B" "$C"
+A="$TMP/folder-a"; B="$TMP/folder-b"; C="$TMP/folder-c"; D="$TMP/folder-d"; mkdir -p "$A" "$B" "$C" "$D"
+# account-a-extra is a PREFIX-superstring of account-a (login "account-a" is a substring of
+# "account-a-extra") — used to prove the markers are matched whole-line, not as substrings.
 cat > "$TMP/folders.json" <<EOF
 [ {"path":"$A","account":"account-a","name":"Account A","email":"a@users.noreply.github.com"},
   {"path":"$B","account":"account-b","name":"Account B","email":"b@users.noreply.github.com"},
-  {"path":"$C","account":"account-c","name":"Account C","email":"c@users.noreply.github.com"} ]
+  {"path":"$C","account":"account-c","name":"Account C","email":"c@users.noreply.github.com"},
+  {"path":"$D","account":"account-a-extra","name":"Account A Extra","email":"ax@users.noreply.github.com"} ]
 EOF
 export IDENTITY_LOCK_CONFIG="$TMP/folders.json"
 
 # The hook now resolves a token via `gh auth token --user <acct>` to write the
-# per-session env-file pin. Stub gh: account-a/-b have tokens, account-c does NOT
+# per-session env-file pin. Stub gh: account-a/-b/-a-extra have tokens, account-c does NOT
 # (simulates a locked account that isn't logged in -> no pin must be written).
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/gh" <<'EOF'
@@ -28,6 +31,7 @@ cat > "$TMP/bin/gh" <<'EOF'
 case "$*" in
   "auth token --user account-a") echo "TOKEN_A" ;;
   "auth token --user account-b") echo "TOKEN_B" ;;
+  "auth token --user account-a-extra") echo "TOKEN_AX" ;;
   *) exit 0 ;;
 esac
 EOF
@@ -143,6 +147,21 @@ t "x-account: sourced env-file authors as account-b" \
 t "x-account: sourced env-file token is account-b" \
   bash -c 'k="$(. "$1" >/dev/null 2>&1; printf "%s" "$GH_TOKEN")"; [ "$k" = TOKEN_B ]' _ "$EF5"
 
+# (4e) PREFIX-COLLISION regression: account-a-extra's login is a superstring of account-a's, so
+# a SUBSTRING marker match (grep -qF) would let account-a false-match account-a-extra's marker
+# line. Pin the SUPERSTRING first, then re-fire the PREFIX account on the same env-file: the
+# prefix account must FULLY re-pin (token + author + pin file), not inherit the superstring's
+# identity. Whole-line (grep -qxF) markers make this pass; substring markers fail it.
+EF6="$TMP/envfile6.sh"; : > "$EF6"
+runp "$D/sub" "sid-prefix" "$EF6"    # superstring account-a-extra pins first
+runp "$A/sub" "sid-prefix" "$EF6"    # prefix account-a re-fires on the SAME env-file
+t "prefix: sourced token is account-a's (not account-a-extra's)" \
+  bash -c 'k="$(. "$1" >/dev/null 2>&1; printf "%s" "$GH_TOKEN")"; [ "$k" = TOKEN_A ]' _ "$EF6"
+t "prefix: sourced author is account-a (not account-a-extra)" \
+  bash -c 'e="$(. "$1" >/dev/null 2>&1; printf "%s" "$GIT_AUTHOR_EMAIL")"; case "$e" in a@*) exit 0;; *) exit 1;; esac' _ "$EF6"
+t "prefix: pin file reads account-a (not account-a-extra)" \
+  bash -c '[ "$(cat "$1" 2>/dev/null)" = account-a ]' _ "$IDENTITY_LOCK_SESSIONS/sid-prefix"
+
 # (5) no CLAUDE_ENV_FILE (e.g. a resume path) -> no pin file (can't verify the pin).
 jq -n --arg c "$A/sub" --arg s "sid-nofile" '{cwd:$c,session_id:$s}' | env -u CLAUDE_ENV_FILE bash "$INIT" >/dev/null 2>&1
 t "no pin file when CLAUDE_ENV_FILE is absent" bash -c '[ ! -f "$1" ]' _ "$IDENTITY_LOCK_SESSIONS/sid-nofile"
@@ -151,9 +170,22 @@ t "no pin file when CLAUDE_ENV_FILE is absent" bash -c '[ ! -f "$1" ]' _ "$IDENT
 ctxNF="$(jq -n --arg c "$A/sub" --arg s "sid-nofile2" '{cwd:$c,session_id:$s}' | env -u CLAUDE_ENV_FILE bash "$INIT" 2>/dev/null)"
 t "no-env-file sub-dir note warns commit author NOT guaranteed" \
   bash -c 'printf "%s" "$1" | jq -e ".hookSpecificOutput.additionalContext | test(\"NOT guaranteed\")" >/dev/null' _ "$ctxNF"
-# (6) the additionalContext for a pinned sub-dir reflects that gh/MCP are pinned here.
+# (5c) a WRITABLE-path-but-UNWRITABLE CLAUDE_ENV_FILE: the append fails silently, nothing is
+# cleared, so any inherited ambient author is STILL live. The note must say so (do NOT commit) —
+# NOT falsely claim "ambient cleared / falls back to gitconfig".
+EFRO="$TMP/envfile-ro.sh"; : > "$EFRO"; chmod 000 "$EFRO"
+ctxRO="$(jq -n --arg c "$A/sub" --arg s "sid-ro" '{cwd:$c,session_id:$s}' | CLAUDE_ENV_FILE="$EFRO" bash "$INIT" 2>/dev/null)"
+chmod 644 "$EFRO"
+t "unwritable env-file: nothing was written" bash -c '[ ! -s "$1" ]' _ "$EFRO"
+t "unwritable env-file note warns ambient STILL ACTIVE" \
+  bash -c 'printf "%s" "$1" | jq -e ".hookSpecificOutput.additionalContext | test(\"STILL ACTIVE\")" >/dev/null' _ "$ctxRO"
+# (6) the additionalContext for a pinned sub-dir reflects that gh/MCP/push + author are pinned.
 EF3="$TMP/envfile3.sh"; : > "$EF3"
 ctxout="$(jq -n --arg c "$A/sub" --arg s "sid-ctx" '{cwd:$c,session_id:$s}' | CLAUDE_ENV_FILE="$EF3" bash "$INIT" 2>/dev/null)"
 t "pinned sub-dir context still names the account" bash -c 'printf "%s" "$1" | jq -e ".hookSpecificOutput.additionalContext | test(\"account-a\")" >/dev/null' _ "$ctxout"
+t "pinned sub-dir note claims git push pinned to the account" \
+  bash -c 'printf "%s" "$1" | jq -e ".hookSpecificOutput.additionalContext | test(\"git push are session-pinned to account-a\")" >/dev/null' _ "$ctxout"
+t "pinned sub-dir note claims commit author pinned to the account" \
+  bash -c 'printf "%s" "$1" | jq -e ".hookSpecificOutput.additionalContext | test(\"commit author is pinned to account-a\")" >/dev/null' _ "$ctxout"
 
 echo "=== $pass passed, $fail failed ==="; [ "$fail" = 0 ]

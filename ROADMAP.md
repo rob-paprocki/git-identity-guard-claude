@@ -33,10 +33,39 @@ out of v1.
   idempotency marker, inherited ambient author/committer is `unset` first, the gh/MCP token pin **and**
   the session pin file stay gated on `$tok` (so the guard never green-lights unpinned gh/MCP), both
   markers are **account-scoped** (a re-fire resolving a different account re-pins author + token + pin
-  file together rather than trusting a stale account), and the sub-directory note is honest in every path
-  (push is only claimed pinned when the token the push credential helper needs is present). Regressions in
-  `test/session-init.test.sh` (4b/4c/4d/5b); applied to the root scripts and the byte-identical
-  `plugin/scripts/` copies.
+  file together rather than trusting a stale account; account markers are matched **whole-line**
+  (`grep -qxF`) so a prefix-named account can't substring-match a longer account's marker line), and the
+  sub-directory note is honest in every path (push is only claimed pinned when the token the push
+  credential helper needs is present; an unwritable env-file warns the ambient identity is still active).
+  Regressions in `test/session-init.test.sh` (4b/4c/4d/4e/5b/5c); applied to the root scripts and the
+  byte-identical `plugin/scripts/` copies.
+
+## Known issues (pre-existing — found in the 2026-06 adversarial review, not yet patched)
+
+These are independent of the author-pin fix above; they live in the guard / installer / resolver and
+defeat or weaken the *push* and *deny-filter* guarantees. Verified with repros.
+
+- **(high) Bare `git push` over an SSH remote isn't pinned.** The credential-helper pin is HTTPS-only and
+  the guard only denies SSH/scp URLs that appear *inline*; an SSH-cloned `origin` (or one set via
+  `git remote set-url`, which the guard doesn't gate) makes `git push origin …` authenticate with the
+  loaded SSH key, not the locked account. Fix ideas: gate `git remote add/set-url`, and/or deny pushes
+  whose effective remote is SSH, and/or document SSH repos as unsupported under a lock.
+- **(high) `git -C ./../x` (and `--git-dir=./..`, `--work-tree=./..`) evade the outside-tree block.** The
+  detection anchors on a leading `../` or `/`; a `./` prefix slips past, letting git operate on a tree
+  outside the locked ROOT. Fix: normalize the path (or also match `./`/`.//`) before the containment test.
+- **(high) A trailing slash (or non-normalized path) in `folders.json` makes the lock inert (fail-open).**
+  `resolve_account` then matches nothing and the guard `exit 0`s (allows everything) for that tree. Fix:
+  normalize/validate paths in `install.sh` (strip trailing `/`, require absolute) and tolerate it in the
+  resolver.
+- **(medium) Guard matcher only covers `Bash` + the github MCP tools.** Other shell-exec MCP tools (e.g.
+  a `*__execute_shell_command`, `osascript`) run git/gh unguarded and outside the env pin. Fix: widen the
+  matcher or document the exposure.
+- **(low) Session pin file is an unauthenticated, agent-writable trust anchor.** Any Bash command can
+  forge `~/.config/identity-lock/sessions/<sid>` to flip a sub-dir gh/MCP DENY to ALLOW. Fix: store it
+  outside agent-writable space, or sign it, or have the guard re-verify the token rather than trust the file.
+- **(nit) `$account` is interpolated unquoted into the generated credential-helper snippet** (`install.sh`)
+  — a malformed/hostile account string becomes shell that git runs on every push. Fix: validate the handle
+  shape and quote it.
 
 ## Candidate future work
 

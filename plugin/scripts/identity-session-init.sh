@@ -41,7 +41,15 @@ SESS_DIR="${IDENTITY_LOCK_SESSIONS:-${IDENTITY_LOCK_DIR:-$HOME/.config/identity-
 sid="$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)"
 pinned_ok=0
 author_pinned=0
+ambient_cleared=0
 tok="$(gh auth token --user "$LOCKED" 2>/dev/null)"
+
+# Markers are matched WHOLE-LINE (grep -qxF) against the exact written marker, NOT as a
+# substring: a substring match (grep -qF "...OK $LOCKED") would let a prefix-named account
+# (e.g. "acme" vs "acme-bot", "rob" vs "rob-paprocki") false-match a longer account's marker
+# LINE on a reused env-file and silently skip its own re-pin. -x requires the full line.
+auth_marker="# identity-lock author pin OK $LOCKED"
+tok_marker="# identity-lock pin OK $LOCKED"
 
 # --- (a) commit author/committer pin — TOKEN-INDEPENDENT (priority patch, 2026-06) ---
 # Pin the locked author/committer into this session's env-file ALWAYS, whether or not the
@@ -55,7 +63,7 @@ tok="$(gh auth token --user "$LOCKED" 2>/dev/null)"
 # marker: a re-fire resolving a DIFFERENT account re-pins (appends fresh exports that win
 # when the env-file is sourced) rather than leaving the previous account's author in place.
 if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
-  if ! grep -qF "identity-lock author pin OK $LOCKED" "$CLAUDE_ENV_FILE" 2>/dev/null; then
+  if ! grep -qxF "$auth_marker" "$CLAUDE_ENV_FILE" 2>/dev/null; then
     {
       # Clear any inherited ambient author/committer first, so even a name/email-less
       # (misconfigured) lock cannot leave a foreign identity in place.
@@ -66,14 +74,15 @@ if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
         printf 'export GIT_COMMITTER_NAME=%q\n'  "$NAME"
         printf 'export GIT_COMMITTER_EMAIL=%q\n' "$EMAIL"
       fi
-      printf '# identity-lock author pin OK %s\n' "$LOCKED"   # marker written LAST
+      printf '%s\n' "$auth_marker"   # marker written LAST
     } >> "$CLAUDE_ENV_FILE" 2>/dev/null
   fi
-  # author_pinned == "the LOCKED account's author identity is actually exported": requires
-  # non-empty name/email AND this account's (not some prior account's) marker present.
-  if [ -n "$NAME" ] && [ -n "$EMAIL" ] \
-     && grep -qF "identity-lock author pin OK $LOCKED" "$CLAUDE_ENV_FILE" 2>/dev/null; then
-    author_pinned=1
+  # The marker is present ONLY if the author block was durably written this session (a failed
+  # append leaves no marker). So: marker present => ambient was cleared; marker present AND
+  # name/email set => the locked author identity is actually exported.
+  if grep -qxF "$auth_marker" "$CLAUDE_ENV_FILE" 2>/dev/null; then
+    ambient_cleared=1
+    [ -n "$NAME" ] && [ -n "$EMAIL" ] && author_pinned=1
   fi
 fi
 
@@ -84,14 +93,14 @@ fi
 # together (never pin-file=account-B while the env-file still exports account-A's token).
 # The pin file is written ONLY here, gated on the token marker — never the author one.
 if [ -n "$tok" ] && [ -n "${CLAUDE_ENV_FILE:-}" ]; then
-  if ! grep -qF "identity-lock pin OK $LOCKED" "$CLAUDE_ENV_FILE" 2>/dev/null; then
+  if ! grep -qxF "$tok_marker" "$CLAUDE_ENV_FILE" 2>/dev/null; then
     {
       printf 'export GH_TOKEN=%q\n'                     "$tok"
       printf 'export GITHUB_PERSONAL_ACCESS_TOKEN=%q\n' "$tok"
-      printf '# identity-lock pin OK %s\n'              "$LOCKED"   # marker written LAST
+      printf '%s\n' "$tok_marker"   # marker written LAST
     } >> "$CLAUDE_ENV_FILE" 2>/dev/null
   fi
-  if [ -n "$sid" ] && grep -qF "identity-lock pin OK $LOCKED" "$CLAUDE_ENV_FILE" 2>/dev/null; then
+  if [ -n "$sid" ] && grep -qxF "$tok_marker" "$CLAUDE_ENV_FILE" 2>/dev/null; then
     if mkdir -p "$SESS_DIR" 2>/dev/null && printf '%s\n' "$LOCKED" > "$SESS_DIR/$sid" 2>/dev/null; then
       chmod 600 "$SESS_DIR/$sid" 2>/dev/null; pinned_ok=1
     fi
@@ -111,12 +120,14 @@ if [ "$cwd_lc" != "$ROOT_LC" ]; then
     # No token => gh, MCP AND git push are all unpinned (the push credential helper needs the
     # same token). Only the commit author is pinned (it is token-independent).
     subdir_note=" SUB-DIRECTORY launch: $author_txt, but the $LOCKED token is unavailable, so gh, GitHub-MCP and git push are NOT pinned here (the push credential helper needs that token). Commits stay correctly authored; run 'gh auth login --user $LOCKED' (or relaunch Claude from $ROOT) before pushing."
-  elif [ -n "${CLAUDE_ENV_FILE:-}" ]; then
-    # Writable env-file but no name/email resolved (a misconfigured lock): ambient was cleared,
-    # so git falls back to the gitconfig [user] pin rather than a foreign identity.
-    subdir_note=" SUB-DIRECTORY launch: this lock has no name/email configured, so $author_txt (the ambient identity was cleared; git falls back to gitconfig). gh/MCP/push are not pinned. Relaunch Claude from $ROOT, or fix this lock's folders.json entry."
+  elif [ "$ambient_cleared" = 1 ]; then
+    # Author block ran (ambient cleared) but no locked name/email to export: git falls back to
+    # the per-folder gitconfig [user] pin rather than any inherited foreign identity.
+    subdir_note=" SUB-DIRECTORY launch: this lock has no name/email configured, so commit author is NOT pinned here — the inherited ambient identity was cleared and git falls back to the gitconfig [user] pin. gh/MCP/push are not pinned. Relaunch Claude from $ROOT, or add name/email to this lock's folders.json entry."
   else
-    subdir_note=" SUB-DIRECTORY launch: identity could NOT be session-pinned here (no writable session env-file), so commit author is NOT guaranteed — do NOT commit. Relaunch Claude from $ROOT, or run 'gh auth login --user $LOCKED', for full coverage."
+    # No writable session env-file (absent OR unwritable): nothing was cleared, so any inherited
+    # ambient identity is STILL ACTIVE and would author commits. Fail loud — do not commit.
+    subdir_note=" SUB-DIRECTORY launch: identity could NOT be session-pinned here (no writable session env-file), so commit author is NOT guaranteed and any inherited ambient identity is STILL ACTIVE — do NOT commit. Relaunch Claude from $ROOT, or run 'gh auth login --user $LOCKED', for full coverage."
   fi
 fi
 
