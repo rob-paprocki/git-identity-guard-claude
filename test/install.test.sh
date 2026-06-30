@@ -201,6 +201,10 @@ jqf "(i) global PreToolUse matcher covers mcp__github__" \
   "$GS" 'any(.hooks.PreToolUse[]; .matcher | test("mcp__github__"))'
 jqf "(i) settings.local.json matcher covers mcp__github__" \
   "$SL" '.hooks.PreToolUse[0].matcher | test("mcp__github__")'
+# (i) M3: the matcher (used AS a regex) also fires for a NON-standard github MCP namespace
+# (GitHub Enterprise / copilot), so such a server is guarded, not fail-open.
+jqf "(i) matcher fires for a non-standard github MCP namespace (M3)" \
+  "$GS" 'any(.hooks.PreToolUse[]; (.matcher) as $m | "mcp__github_enterprise__create_pull_request" | test($m))'
 
 # ===========================================================================
 # Task 6: osxkeychain opt-in hardening + uninstall.sh.

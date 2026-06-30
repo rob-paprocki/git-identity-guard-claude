@@ -13,8 +13,10 @@
 # `gi""t`), it uses the locked account by DEFAULT. This guard therefore does not
 # try to detect invocations; it is a DENY-ONLY filter that blocks the bounded set
 # of constructs that could OVERRIDE or STRIP the pinned identity. Those constructs
-# target fixed UPPERCASE variable names / fixed git flags, which (unlike command
-# names) cannot be obfuscated by quote-splitting — so detection is reliable.
+# target fixed UPPERCASE variable names / fixed git flags. Common in-band obfuscations of a name that
+# bash collapses back (quote-splitting `GH""_TOKEN`, backslash `GH\_TOKEN`, brace `GH{A,_}TOKEN`,
+# `$`-expansion `${v}`) are EXPLICITLY caught (rules 1/1b/1d). A determined arbitrary-code interpreter can
+# still build a name no command-string regex can see — that is the documented residual floor (see below).
 #
 # It also fail-closes GitHub MCP write tools unless the MCP token is the locked
 # account's. No rewrite (no injection surface). Defensive: no set -e/pipefail.
@@ -59,28 +61,50 @@ ROOT="$(jq -r --arg c "$cwd_lc" '
   | select($cc == $p or ($cc | startswith($p + "/")))
   | (.path | sub("/+$";""))' "$IDLOCK_CFG" 2>/dev/null | head -1)"
 ROOT_LC="$(printf '%s' "$ROOT" | tr '[:upper:]' '[:lower:]')"
+# Regex-escape ROOT_LC before it is spliced into the -C in-tree exception grep (rule 4): an unescaped
+# metacharacter in a configured lock path (a '.' in 'v1.2'/'.claude', '+', '[', '(', …) would widen the
+# match so an outside sibling ('v1X2') is treated as in-tree — or, if unbalanced, break the ERE and
+# wrongly DENY legit in-tree work. Escape every non-[alnum _ / -] char. (L1.)
+ROOT_LC_RE="$(printf '%s' "$ROOT_LC" | sed 's/[^A-Za-z0-9_/-]/\\&/g')"
 
 deny() { jq -n --arg r "$1" '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}'; exit 0; }
 
 # ===================== GitHub MCP tools =====================
 case "$tool" in
-  mcp__plugin_github_github__*|mcp__github__*)
-    # Strip BOTH possible prefixes — the plugin server (mcp__plugin_github_github__)
-    # OR the user-scoped headersHelper override (mcp__github__) — so the write
-    # classifier sees the bare action either way. Matching the new namespace in the
-    # matcher WITHOUT also stripping it here would misclassify every override-
-    # namespace write as a read and allow it (fail-open).
-    action="$tool"; action="${action#mcp__plugin_github_github__}"; action="${action#mcp__github__}"
-    if printf '%s' "$action" | grep -Eq '^(create|update|delete|merge|push|fork|add_|sub_|request_)|_write$'; then
+  mcp__github__*|mcp__plugin_github_github__*|mcp__*github*__*)
+    # The NAMESPACE determines where the connection token comes from, which determines how we verify it:
+    #   override (mcp__github__*)        — supplied LIVE at connect by the headersHelper
+    #                                      (gh auth token --user $LOCKED); the env var is NOT used.
+    #   plugin   (mcp__plugin_github_github__*) — the static env GITHUB_PERSONAL_ACCESS_TOKEN.
+    #   other    (any other mcp__…github…__) — a separately-configured github MCP server (Enterprise,
+    #                                      copilot, …); token source unknown, so verify strictly (fail-closed).
+    # Matching the broader 'other' namespace closes a fail-OPEN: previously such a server skipped the guard
+    # entirely. (The hook MATCHER in settings must also be widened — install.sh does this; pre-existing
+    # installs must re-run install.sh to guard non-standard github namespaces.)
+    case "$tool" in
+      mcp__github__*)               ns=override; action="${tool#mcp__github__}" ;;
+      mcp__plugin_github_github__*) ns=plugin;   action="${tool#mcp__plugin_github_github__}" ;;
+      *)                            ns=other;    action="${tool##*__}" ;;
+    esac
+    # READ-ALLOWLIST (default-deny): only get/list/search and the two *_read read tools are reads; EVERY
+    # other tool name is treated as a WRITE and token-checked. The previous verb-allowlist let writes whose
+    # verb wasn't enumerated (assign_/mark_/dismiss_/manage_/run_secret_scanning — even a future renamed
+    # write) through as "reads". NOTE 'mark_all_notifications_read' is a WRITE despite the _read suffix, so
+    # the read test anchors on issue_read/pull_request_read exactly, never a _read$ suffix.
+    if ! printf '%s' "$action" | grep -Eq '^(get|list|search)|^(issue_read|pull_request_read)$'; then
       want="$(gh auth token --user "$LOCKED" 2>/dev/null)"
       [ -z "$want" ] && deny "Identity guard: GitHub MCP write '$tool' blocked — the $LOCKED account isn't available (run 'gh auth login --user $LOCKED')."
       have="${GITHUB_PERSONAL_ACCESS_TOKEN:-}"
       if [ -n "$have" ]; then
         [ "$have" = "$want" ] && exit 0
+        # override namespace: the connection token is ALWAYS the live $LOCKED token from the headersHelper,
+        # so a baked/rotated/foreign env GITHUB_PERSONAL_ACCESS_TOKEN is irrelevant — the write still acts
+        # as $LOCKED. (Denying here was a false-positive DoS after a `gh auth refresh`/re-login.)
+        [ "$ns" = override ] && exit 0
         deny "Identity guard: GitHub MCP write '$tool' would act as a non-$LOCKED account (MCP token != $LOCKED)."
       fi
-      # Sub-directory launch: the MCP token is supplied at connect by the headersHelper
-      # override and is NOT in this hook's env. Verify pinning via the session pin file.
+      # Sub-directory launch: the MCP token is supplied at connect by the headersHelper override and is NOT
+      # in this hook's env. Verify pinning via the session pin file.
       [ "$(session_pin)" = "$LOCKED" ] && exit 0
       deny "Identity guard: GitHub MCP write '$tool' is not provably pinned to $LOCKED (no session pin — a sub-directory launch without the MCP override, or a cross-tree cd). Relaunch Claude from $ROOT, or use the gh CLI."
     fi
@@ -103,7 +127,10 @@ hasi() { printf '%s' "$cmd" | grep -Eqi -- "$1"; }   # case-insensitive (git con
 
 # Pinned / sensitive variable names. Assignment or override of any of these could
 # re-point identity (tokens, git author) or inject code (BASH_ENV, LD_PRELOAD, …).
-PV='(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GH_HOST|GH_CONFIG_DIR|GITHUB_PERSONAL_ACCESS_TOKEN|GIT_AUTHOR_NAME|GIT_AUTHOR_EMAIL|GIT_COMMITTER_NAME|GIT_COMMITTER_EMAIL|GIT_CONFIG[A-Z0-9_]*|GIT_SSH[A-Z0-9_]*|GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_PROXY_COMMAND|GIT_EXTERNAL_DIFF|HOME|XDG_CONFIG_HOME|BASH_ENV|ENV|PROMPT_COMMAND|PS4|LD_PRELOAD|DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH)'
+PV='(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GH_HOST|GH_CONFIG_DIR|GITHUB_PERSONAL_ACCESS_TOKEN|GIT_AUTHOR_NAME|GIT_AUTHOR_EMAIL|GIT_COMMITTER_NAME|GIT_COMMITTER_EMAIL|GIT_CONFIG[A-Z0-9_]*|GIT_SSH[A-Z0-9_]*|GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_PROXY_COMMAND|GIT_EXTERNAL_DIFF|HOME|XDG_CONFIG_HOME|BASH_ENV|PROMPT_COMMAND|PS4|LD_PRELOAD|DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH)'
+# NOTE: the POSIX-sh startup var `ENV` was intentionally REMOVED from PV: as a bare 3-letter token it
+# matched ubiquitous, identity-irrelevant build/CI invocations (`make ENV=prod`, `docker run -e ENV=…`,
+# `terraform -var ENV=…`, `printenv ENV`) and wrongly DENIED them. BASH_ENV (the bash analog) stays.
 NR='[^A-Za-z0-9_${#!]'   # a char that is NOT part of a $NAME / ${NAME} / ${#NAME} / ${!NAME} read
 
 # 1) Any NON-READ appearance of a pinned/sensitive name. Covers direct assignment
@@ -123,9 +150,32 @@ has '\benv\b[[:space:]]+(-[-A-Za-z]+[[:space:]]+)*[^=;|&[:space:]]*\$' && \
 has '\b(printf[[:space:]]+-v|read|mapfile|readarray)\b[[:space:]]+(-[-A-Za-z]+[[:space:]]+)*[^;|&[:space:]]*\$' && \
   deny "Identity guard: refusing a dynamically-named 'printf -v'/'read' target in the $LOCKED workspace."
 
-# 1c) source/. of a file can set identity overrides the guard can't inspect.
+# 1d) An assignment NAME built by ANY in-band obfuscation that bash collapses back into a pinned name —
+#     brace expansion (`GH{A,_}TOKEN`), OR quote/backslash splitting that quote-removal rebuilds
+#     (`GH""_TOKEN`, `GH''_TOKEN`, `GH\_TOKEN`, mid-name `GIT_AUTHOR""_NAME`) — sets the real variable with
+#     NO literal substring and NO '$', so it evades rule 1 (literal name) AND rule 1b ('$'-built names).
+#     Deny any export/declare/typeset/readonly/local/env whose name-token (the part BEFORE '=') contains a
+#     '{', a quote, or a backslash. A brace/quote/backslash in the VALUE (after '=', e.g. `export P=/x/{a,b}`
+#     or `export G="hi there"`) is NOT matched — the name-token class [^=…] stops at the '='. (The bare-prefix
+#     form `GH""_TOKEN=v cmd` is not recognized as a bash assignment-prefix, so only these builtins set it.)
+has '\b(export|declare|typeset|readonly|local)\b[[:space:]]+(-[-A-Za-z]+[[:space:]]+)*[^=;|&[:space:]]*([{"'\'']|\\)' && \
+  deny "Identity guard: refusing an obfuscated (brace/quote/backslash) variable-NAME assignment in the $LOCKED workspace — the name could rebuild a pinned identity variable. Use a literal NAME=value (non-identity)."
+has '\benv\b[[:space:]]+(-[-A-Za-z]+[[:space:]]+)*[^=;|&[:space:]]*([{"'\'']|\\)' && \
+  deny "Identity guard: refusing 'env' with an obfuscated (brace/quote/backslash) variable name in the $LOCKED workspace."
+# Same obfuscation in a printf -v / read / mapfile TARGET name (no '=' there). Require a WORD char
+# immediately before the brace/quote/backslash so an embedded-name char (`read GH""_TOKEN`) is caught
+# while a leading-quote ARGUMENT (a prompt: `read -p "Continue? " ans`) is not a false positive.
+has '\b(printf[[:space:]]+-v|read|mapfile|readarray)\b[[:space:]]+(-[-A-Za-z]+[[:space:]]+)*[^;|&[:space:]]*[A-Za-z0-9_]([{"'\'']|\\)' && \
+  deny "Identity guard: refusing an obfuscated (brace/quote/backslash) 'printf -v'/'read'/'mapfile' target name in the $LOCKED workspace."
+
+# 1c) source/. of a file can set identity overrides the guard can't inspect. The plain form is anchored
+#     to a segment start; the second check also catches a leading 'command'/'builtin'/'time' or a
+#     VAR=value assignment-prefix (`command source x`, `builtin . x`, `time source x`, `FOO=1 source x`),
+#     all of which run the source/. builtin in the CURRENT shell just like a bare `source`.
 has '(^|[;&|({]|&&|\|\|)[[:space:]]*(source|\.)[[:space:]]' && \
   deny "Identity guard: 'source'/'.' of a file is blocked in the $LOCKED workspace (it could set identity overrides off-screen). Inline the commands instead."
+has '(^|[;&|({]|&&|\|\|)[[:space:]]*(command|builtin|time|[A-Za-z_][A-Za-z0-9_]*=[^[:space:];&|]*)[[:space:]]+(source|\.)[[:space:]]' && \
+  deny "Identity guard: 'source'/'.' (via command/builtin/time/assignment-prefix) is blocked in the $LOCKED workspace (it could set identity overrides off-screen). Inline the commands instead."
 
 # 2) Dynamic construction / env-stripping / elevation / remote shells.
 has '\beval\b'  && deny "Identity guard: 'eval' is blocked in the $LOCKED workspace (it can construct identity overrides the guard can't inspect)."
@@ -170,12 +220,15 @@ if has '\bgit\b[^;&|]*-C[[:space:]]+(/|~)' \
    || has '\bgit\b[^;&|]*-C[[:space:]]+([^[:space:]]*/)?\.\.(/|[[:space:]]|$)' \
    || has '(--git-dir|--work-tree)[[:space:]=]+(/|~)' \
    || has '(--git-dir|--work-tree)[[:space:]=]+([^[:space:]]*/)?\.\.(/|[[:space:]]|$)'; then
-  printf '%s' "$cmd" | grep -Eqi -- "(-C[[:space:]]+|--git-dir[[:space:]=]+|--work-tree[[:space:]=]+)${ROOT_LC}(/|[[:space:]]|\$)" \
+  printf '%s' "$cmd" | grep -Eqi -- "(-C[[:space:]]+|--git-dir[[:space:]=]+|--work-tree[[:space:]=]+)${ROOT_LC_RE}(/|[[:space:]]|\$)" \
     || deny "Identity guard: 'git -C/--git-dir/--work-tree' targeting a path outside the locked folder ($ROOT), or any path with a '..' component, is blocked (the identity pin only applies under that tree)."
 fi
 
 # 5) gh: explicit auth-header / hostname override, token login, logout.
-if has '\bgh[[:space:]]+api\b' && has '(-H|--header)' && has '[Aa]uthorization'; then
+# Header NAMES are case-insensitive (HTTP), so match 'authorization' case-insensitively (an UPPERCASE
+# or mixed-case header evades a first-letter-only [Aa] match). Allow global flags between 'gh' and 'api'
+# (`gh --verbose api …`) so adjacency can't be used to dodge the rule.
+if has '\bgh[[:space:]]+(-[^[:space:]]*[[:space:]]+)*api\b' && has '(-H|--header)' && hasi 'authorization'; then
   deny "Identity guard: 'gh api' with an explicit Authorization header is blocked in the $LOCKED workspace (it would act as another account)."
 fi
 has '\bgh[[:space:]]+api\b[^;&|]*--hostname' && \
@@ -184,13 +237,23 @@ has '\bgh[[:space:]]+auth[[:space:]]+login\b[^;&|]*--with-token' && \
   deny "Identity guard: 'gh auth login --with-token' is blocked in the $LOCKED workspace."
 has '\bgh[[:space:]]+auth[[:space:]]+logout\b' && \
   deny "Identity guard: 'gh auth logout' is blocked in the $LOCKED workspace (it would break the pinned git credential helper)."
+has '\bgh[[:space:]]+auth[[:space:]]+setup-git\b' && \
+  deny "Identity guard: 'gh auth setup-git' writes a git credential helper into your gitconfig (it can shadow the per-folder pinned helper); blocked in the $LOCKED workspace — push is already pinned."
 
-# 6) SSH / scp-style remote push, or a push URL with embedded credentials.
-if has '\bpush\b'; then
-  has '(git@|ssh://)' && deny "Identity guard: SSH-remote push can't be identity-pinned to $LOCKED. Use an https:// remote."
-  has '(^|[[:space:]])([A-Za-z0-9_.-]+@)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}:[^/[:space:]]' && \
+# 6) push (or 'send-pack', the push plumbing that carries no 'push' word) over SSH/scp, or with an
+# embedded-credential URL. Each check is SEGMENT-SCOPED to the push/send-pack command ([^;&|]*) so a
+# host:port token in an unrelated later segment (a comment, an echo) is NOT a false positive. The scp
+# host detector mirrors rule 6b: a dotless alias, an IP, or a 1-char TLD all count (the old
+# '\.[A-Za-z]{2,}:' required a dotted host and let `server:` / `10.0.0.1:` / `h.x:` slip). https:// never
+# matches it (its ':' is followed by '//', and the host after '//' is not space-anchored). The
+# embedded-credential check matches ANY userinfo (`//token@` with no colon, as well as `//user:pass@`)
+# and is case-insensitive (a `HTTPS://` scheme evaded the lowercase-only form).
+if has '\b(push|send-pack)\b'; then
+  hasi '\b(push|send-pack)\b[^;&|]*(git@|ssh://)' && \
+    deny "Identity guard: SSH-remote push can't be identity-pinned to $LOCKED. Use an https:// remote."
+  has '\b(push|send-pack)\b[^;&|]*[[:space:]]([A-Za-z0-9_.-]+@)?[A-Za-z0-9_.-]+:/?[^/[:space:]]' && \
     deny "Identity guard: scp-style remote push can't be identity-pinned to $LOCKED. Use an https:// remote."
-  has 'https?://[^/[:space:]]*:[^/@[:space:]]*@' && \
+  hasi '\b(push|send-pack)\b[^;&|]*https?://[^/[:space:]]*@' && \
     deny "Identity guard: refusing a push URL with embedded credentials in the $LOCKED workspace."
 fi
 
@@ -215,6 +278,19 @@ if hasi '(\.git/config\b|/gitconfig\b|\.gitconfig\b|/\.config/git/)'; then
     deny "Identity guard: writing/replacing a git config file is blocked in the $LOCKED workspace."
 fi
 
+# 7b) Direct writes/deletes to the guard's OWN trust anchors — the lock config dir
+# (~/.config/identity-lock/, incl. folders.json and the session pin files) and the installed hook scripts
+# (~/.claude/hooks/, incl. identity-guard.sh / identity-session-init.sh / lib/resolve-account.sh /
+# mcp-github-headers.sh). Removing or corrupting folders.json makes resolve_account return empty and the
+# guard fail-OPEN (exit 0) for every subsequent command; clobbering a hook script disables enforcement
+# outright. Rule 7 covered git-config files but not these. Reads (cat/grep/ls) stay allowed — only
+# mutating verbs are blocked. (Exotic deletions — xargs rm, find -delete — are a documented residual.)
+if hasi '(/\.config/identity-lock|/\.claude/hooks)'; then
+  { has '(^|[;&|]|&&|\|\|)[[:space:]]*(rm|unlink|shred)\b' \
+    || has '(>|[[:space:]]tee\b|sed[[:space:]]+-i|\b(cp|mv|ln|dd|install|truncate|chmod|chown)\b)'; } && \
+    deny "Identity guard: modifying or deleting the guard's own policy files / hook scripts is blocked in the $LOCKED workspace."
+fi
+
 # 8) FAIL CLOSED if this session is not actually token-pinned to $LOCKED. The settings env GH_TOKEN
 #    is injected into every command (verified), so a missing/wrong GH_TOKEN means the session wasn't
 #    launched at the folder root (e.g. a sub-directory) and a 'gh' command would act as the active
@@ -224,6 +300,10 @@ gh_real=0
 if has '\bgh\b'; then
   printf '%s' "$cmd" | grep -oE '\bgh[[:space:]]+[a-z][a-z-]*' | grep -qvE '[[:space:]]auth$' && gh_real=1
   printf '%s' "$cmd" | grep -qE '\bgh[[:space:]]+[a-z]' || gh_real=1
+  # 'gh auth switch'/'refresh' MUTATE which account gh acts as — NOT read-exempt. In an unpinned tree
+  # (no GH_TOKEN, no session pin) they must fail-closed like any other real gh write. (setup-git is denied
+  # outright above; at a pinned root these are harmless because GH_TOKEN overrides the active account.)
+  has '\bgh[[:space:]]+auth[[:space:]]+(switch|refresh)\b' && gh_real=1
 fi
 if [ "$gh_real" = 1 ]; then
   want="$(gh auth token --user "$LOCKED" 2>/dev/null)"

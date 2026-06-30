@@ -188,4 +188,37 @@ t "pinned sub-dir note claims git push pinned to the account" \
 t "pinned sub-dir note claims commit author pinned to the account" \
   bash -c 'printf "%s" "$1" | jq -e ".hookSpecificOutput.additionalContext | test(\"commit author is pinned to account-a\")" >/dev/null' _ "$ctxout"
 
+# ---------------------------------------------------------------------------
+# HARDENING (2026-06 red-team fixes) for the env-file pin.
+# ---------------------------------------------------------------------------
+
+# (H3) A->B->A return hop on ONE reused env-file: the previous design SKIPPED re-pinning account-a on
+# fire 3 (its markers were already present from fire 1), so account-b's fire-2 exports stayed LAST and
+# WON when sourced, while the pin file was rewritten to account-a — "env says B, pin says A". The
+# strip-then-reappend design must make account-a win AND keep the pin file consistent (account-a).
+EFH3="$TMP/envfileH3.sh"; : > "$EFH3"
+runp "$A/sub" "sid-aba" "$EFH3"     # fire 1: account-a
+runp "$B/sub" "sid-aba" "$EFH3"     # fire 2: resume resolves account-b
+runp "$A/sub" "sid-aba" "$EFH3"     # fire 3: back to account-a
+t "H3: sourced author is account-a after A->B->A" \
+  bash -c 'e="$(. "$1" >/dev/null 2>&1; printf "%s" "$GIT_AUTHOR_EMAIL")"; case "$e" in a@*) exit 0;; *) exit 1;; esac' _ "$EFH3"
+t "H3: sourced token is account-a (TOKEN_A) after A->B->A" \
+  bash -c 'k="$(. "$1" >/dev/null 2>&1; printf "%s" "$GH_TOKEN")"; [ "$k" = TOKEN_A ]' _ "$EFH3"
+t "H3: pin file agrees (account-a) after A->B->A" \
+  bash -c '[ "$(cat "$1" 2>/dev/null)" = account-a ]' _ "$IDENTITY_LOCK_SESSIONS/sid-aba"
+t "H3: author email bounded to exactly one line" \
+  bash -c '[ "$(grep -c "^export GIT_AUTHOR_EMAIL=" "$1")" = 1 ]' _ "$EFH3"
+
+# (H4) FORGED markers: an env-file pre-seeded ONLY with the marker comment lines (no exports — the agent
+# can append these guard-invisible comments) must NOT trick the hook into skipping the unset+export. The
+# inherited ambient author must still be cleared and the locked author/token pinned.
+EFH4="$TMP/envfileH4.sh"
+{ printf '# identity-lock author pin OK account-a\n'; printf '# identity-lock pin OK account-a\n'; } > "$EFH4"
+runp "$A/sub" "sid-forge" "$EFH4"
+t "H4: forged marker did NOT suppress the locked author (ambient overridden)" \
+  bash -c 'e="$(export GIT_AUTHOR_EMAIL=evil@attacker.example; . "$1" >/dev/null 2>&1; printf "%s" "$GIT_AUTHOR_EMAIL")"; case "$e" in a@*) exit 0;; *) exit 1;; esac' _ "$EFH4"
+t "H4: forged marker did NOT suppress the unset (ambient cleared)" grep -q '^unset GIT_AUTHOR_NAME ' "$EFH4"
+t "H4: forged marker did NOT suppress the token pin"               grep -q '^export GH_TOKEN=.*TOKEN_A' "$EFH4"
+t "H4: author marker bounded to exactly one line"                  bash -c '[ "$(grep -c "identity-lock author pin OK" "$1")" = 1 ]' _ "$EFH4"
+
 echo "=== $pass passed, $fail failed ==="; [ "$fail" = 0 ]

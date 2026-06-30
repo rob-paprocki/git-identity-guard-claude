@@ -13,11 +13,15 @@ GUARD="$(cd "$(dirname "$0")/.." && pwd)/identity-guard.sh"
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 A="$TMP/folder-a"; B="$TMP/folder-b"; C="$TMP/folder-c"; OUT="$TMP/elsewhere"; mkdir -p "$A" "$B" "$C" "$OUT"
+# E has a regex-METACHARACTER ('.') in its path — used to prove the -C in-tree exception escapes ROOT
+# before splicing it into a grep -E (L1): an unescaped '.' would let the sibling "v1X2" match "v1.2".
+E="$TMP/v1.2"; ESIB="$TMP/v1X2"; mkdir -p "$E" "$ESIB"
 RE="0000000+account-a@users.noreply.github.com"            # fixture "locked email"
 cat > "$TMP/folders.json" <<EOF
 [ {"path":"$A","account":"account-a","name":"Account A","email":"$RE"},
   {"path":"$B","account":"account-b","name":"Account B","email":"0001+account-b@users.noreply.github.com"},
-  {"path":"$C","account":"account-c","name":"Account C","email":"0002+account-c@users.noreply.github.com"} ]
+  {"path":"$C","account":"account-c","name":"Account C","email":"0002+account-c@users.noreply.github.com"},
+  {"path":"$E","account":"account-a","name":"Account A","email":"$RE"} ]
 EOF
 export IDENTITY_LOCK_CONFIG="$TMP/folders.json"
 
@@ -320,10 +324,118 @@ pinmcp "subdir MCP read pinned -> ALLOW"              ALLOW mcp__plugin_github_g
 
 # ---- NEW namespace from the user-scoped override: mcp__github__* must be matched too ----
 ok     "override-ns MCP write a token -> ALLOW"       ALLOW mcp__github__create_pull_request "" "$A" "$ROBTOK"
-ok     "override-ns MCP write wrong token -> DENY"    DENY  mcp__github__create_pull_request "" "$A" "$OTHER"
+ok     "override-ns MCP write 'wrong' env token -> ALLOW (L3: live headersHelper supplies the locked token; env var is irrelevant)" ALLOW mcp__github__create_pull_request "" "$A" "$OTHER"
 ok     "override-ns MCP read -> ALLOW"                ALLOW mcp__github__get_file_contents   "" "$A" "$OTHER"
 pinmcp "override-ns subdir MCP write pinned -> ALLOW" ALLOW mcp__github__create_pull_request "$A/sub" "m5" "account-a"
 pinmcp "override-ns subdir MCP write NO pin -> DENY"  DENY  mcp__github__create_pull_request "$A/sub" "m6" ""
+
+# ============================================================================
+# HARDENING (2026-06 red-team fixes) — bypasses/false-positives found + verified.
+# ============================================================================
+
+# ---- H5: gh api Authorization header is case-insensitive; flags may precede 'api' ----
+ok "gh api -H UPPER Authorization -> DENY"     DENY Bash "gh api -X POST /repos/o/r/issues -H 'AUTHORIZATION: token OTHER' -f title=x" "$A"
+ok "gh api -H mixed-case auth -> DENY"         DENY Bash "gh api -X POST /repos/o/r/issues -H 'authoriZATION: token OTHER' -f title=x" "$A"
+ok "gh <flag> api -H Authorization -> DENY"    DENY Bash "gh --verbose api /repos/o/r -H 'Authorization: token OTHER'" "$A"
+ok "gh pr create (api word in title) -> ALLOW" ALLOW Bash "gh pr create -t 'new api authorization layer'" "$A"
+
+# ---- H6: git send-pack is a push primitive and must hit the push rules ----
+ok "git send-pack ssh git@ -> DENY"            DENY Bash "git send-pack git@github.com:foo/bar.git main" "$A"
+ok "git send-pack scp alias -> DENY"           DENY Bash "git send-pack server:repo refs/heads/main" "$A"
+
+# ---- H7: scp push to dotless host / IP / 1-char TLD (push path, like remote add 6b) ----
+ok "git push scp dotless alias -> DENY"        DENY Bash "git push server:repo.git main" "$A"
+ok "git push scp IP host -> DENY"              DENY Bash "git push 10.0.0.1:repo.git main" "$A"
+ok "git push scp 1-char TLD -> DENY"           DENY Bash "git push h.x:repo.git main" "$A"
+ok "git push https :port -> ALLOW"             ALLOW Bash "git push https://github.com:443/foo/bar main" "$A"
+ok "git push https userinfo plain -> ALLOW"    ALLOW Bash "git push https://github.com/foo/bar main" "$A"
+
+# ---- L4/L5: embedded-credential URL (single userinfo, no colon) + uppercase scheme ----
+ok "git push https://token@ (1 userinfo) -> DENY" DENY Bash "git push https://gho_ATTACKER@github.com/foo/bar.git main" "$A"
+ok "git push HTTPS:// uppercase creds -> DENY"    DENY Bash "git push HTTPS://x:tok@github.com/foo/bar main" "$A"
+
+# ---- L6: Rule 6 segment-scoped — a host:port token in a LATER segment is not the push ----
+ok "git push origin; echo host:port note -> ALLOW" ALLOW Bash "git push origin main; echo see runbook at example.com:8080 now" "$A"
+ok "push origin && push scp (2nd seg) -> DENY"     DENY Bash "git push origin main && git push server:repo.git main" "$A"
+
+# ---- M4: source/. anchor — command/builtin/time/assignment-prefix must not evade ----
+ok "command source file -> DENY"               DENY Bash "command source /tmp/x.sh ; gh pr create" "$A"
+ok "builtin source file -> DENY"               DENY Bash "builtin source /tmp/x.sh" "$A"
+ok "time source file -> DENY"                  DENY Bash "time source /tmp/x.sh" "$A"
+ok "FOO=1 source file -> DENY"                 DENY Bash "FOO=1 source /tmp/x.sh" "$A"
+ok "command . file -> DENY"                    DENY Bash "command . /tmp/x.sh" "$A"
+ok "command ls (not source) -> ALLOW"          ALLOW Bash "command ls -la" "$A"
+ok "commit msg with 'source' word -> ALLOW"    ALLOW Bash "git commit -m 'refactor source tree'" "$A"
+
+# ---- M5: bare ENV must NOT over-block ubiquitous build/CI commands ----
+ok "make ENV=prod (not pinned) -> ALLOW"       ALLOW Bash "make ENV=prod all" "$A"
+ok "docker -e ENV=production -> ALLOW"         ALLOW Bash "docker run -e ENV=production img" "$A"
+ok "terraform -var ENV=staging -> ALLOW"       ALLOW Bash "terraform apply -var ENV=staging" "$A"
+ok "BASH_ENV= still DENY (regression)"         DENY  Bash "BASH_ENV=/tmp/x.sh gh pr create" "$A"
+
+# ---- H2: brace-expansion builds a pinned var NAME (no literal substring, no '$') ----
+ok "export GH{A,_}TOKEN= brace -> DENY"        DENY Bash "export GH{A,_}TOKEN=gho_EVIL ; gh pr create" "$A"
+ok "declare GH{A,_}TOKEN= brace -> DENY"       DENY Bash "declare GH{A,_}TOKEN=gho_EVIL ; gh pr create" "$A"
+ok "readonly GIT_AUTHOR_{X,NAME}= brace -> DENY" DENY Bash "readonly GIT_AUTHOR_{X,NAME}=Mallory ; git commit -m y" "$A"
+ok "env GH{A,_}TOKEN= brace -> DENY"           DENY Bash "env GH{A,_}TOKEN=gho_EVIL gh pr create" "$A"
+ok "export brace in VALUE -> ALLOW"            ALLOW Bash "export OUTDIR=/srv/{a,b}" "$A"
+ok "echo brace (not assign) -> ALLOW"          ALLOW Bash "echo {a,b,c}" "$A"
+
+# ---- H8: quote/backslash splitting in an assignment NAME (sibling of H2; quote-removal rebuilds it) ----
+ok "export GH\"\"_TOKEN= -> DENY"              DENY Bash "export GH\"\"_TOKEN=EVIL ; gh pr create" "$A"
+ok "export GH''_TOKEN= -> DENY"                DENY Bash "export GH''_TOKEN=EVIL ; gh pr create" "$A"
+ok "export GH\\_TOKEN= (backslash) -> DENY"    DENY Bash "export GH\\_TOKEN=EVIL ; gh pr create" "$A"
+ok "export GH_TO\"\"KEN= (mid-name) -> DENY"   DENY Bash "export GH_TO\"\"KEN=EVIL ; gh pr create" "$A"
+ok "export GIT_AUTHOR\"\"_NAME= -> DENY"       DENY Bash "export GIT_AUTHOR\"\"_NAME=Mallory ; git commit -m y" "$A"
+ok "env GH\"\"_TOKEN= -> DENY"                 DENY Bash "env GH\"\"_TOKEN=EVIL gh pr create" "$A"
+ok "export quoted VALUE -> ALLOW"              ALLOW Bash "export GREETING=\"hello world\"" "$A"
+ok "export VALUE cmd-subst -> ALLOW"           ALLOW Bash "export STAMP=\"\$(date +%s)\"" "$A"
+# H8 also covers read/printf -v/mapfile targets (embedded quote/backslash), but must NOT trip on a
+# leading-quote prompt arg (read -p "..."), so the name detector requires a WORD char before the quote.
+ok "read GH\"\"_TOKEN target -> DENY"          DENY Bash "read GH\"\"_TOKEN <<< EVIL ; gh pr create" "$A"
+ok "printf -v GH\"\"_TOKEN target -> DENY"     DENY Bash "printf -v GH\"\"_TOKEN EVIL ; gh pr create" "$A"
+ok "mapfile -t GH\"\"_TOKEN target -> DENY"    DENY Bash "mapfile -t GH\"\"_TOKEN <<< EVIL" "$A"
+ok "read GH\\_TOKEN (backslash) -> DENY"       DENY Bash "read GH\\_TOKEN <<< EVIL" "$A"
+ok "read -p literal prompt -> ALLOW"           ALLOW Bash "read -p \"Continue? \" ans" "$A"
+
+# ---- M2: MCP write-classifier is a READ-allowlist (default-deny unknown verbs), PLUGIN ns (env token) ----
+ok "MCP plugin mark_all_read (write) wrong tok -> DENY"  DENY  mcp__plugin_github_github__mark_all_notifications_read "" "$A" "$OTHER"
+ok "MCP plugin dismiss_notification wrong tok -> DENY"   DENY  mcp__plugin_github_github__dismiss_notification "" "$A" "$OTHER"
+ok "MCP plugin run_secret_scanning wrong tok -> DENY"    DENY  mcp__plugin_github_github__run_secret_scanning "" "$A" "$OTHER"
+ok "MCP plugin assign_copilot wrong tok -> DENY"         DENY  mcp__plugin_github_github__assign_copilot_to_issue "" "$A" "$OTHER"
+ok "MCP plugin mark_all_read correct tok -> ALLOW"       ALLOW mcp__plugin_github_github__mark_all_notifications_read "" "$A" "$ROBTOK"
+ok "MCP plugin issue_read (read) wrong tok -> ALLOW"     ALLOW mcp__plugin_github_github__issue_read "" "$A" "$OTHER"
+ok "MCP plugin pull_request_read (read) wrong tok -> ALLOW" ALLOW mcp__plugin_github_github__pull_request_read "" "$A" "$OTHER"
+ok "MCP plugin get_me (read) wrong tok -> ALLOW"         ALLOW mcp__plugin_github_github__get_me "" "$A" "$OTHER"
+ok "MCP plugin list_issues (read) wrong tok -> ALLOW"    ALLOW mcp__plugin_github_github__list_issues "" "$A" "$OTHER"
+
+# ---- M3: a DIFFERENTLY-NAMED github MCP server is matched (and token-checked), not fail-open ----
+ok "MCP enterprise-ns write wrong tok -> DENY" DENY  mcp__github_enterprise__create_pull_request "" "$A" "$OTHER"
+ok "MCP copilot-ns write wrong tok -> DENY"    DENY  mcp__githubcopilot__push_files "" "$A" "$OTHER"
+ok "MCP enterprise-ns write correct tok -> ALLOW" ALLOW mcp__github_enterprise__create_pull_request "" "$A" "$ROBTOK"
+ok "MCP enterprise-ns read wrong tok -> ALLOW" ALLOW mcp__github_enterprise__get_file_contents "" "$A" "$OTHER"
+
+# ---- H1: the guard's OWN trust anchors (lock config + hook scripts) are write/delete-protected ----
+ok "rm folders.json -> DENY"                   DENY Bash "rm -f ~/.config/identity-lock/folders.json" "$A"
+ok "clobber folders.json via > -> DENY"        DENY Bash "printf 'garbage' > ~/.config/identity-lock/folders.json" "$A"
+ok "truncate folders.json (: >) -> DENY"       DENY Bash ": > ~/.config/identity-lock/folders.json" "$A"
+ok "rm -rf identity-lock dir -> DENY"          DENY Bash "rm -rf ~/.config/identity-lock" "$A"
+ok "overwrite guard hook script -> DENY"       DENY Bash "echo 'resolve_account(){ :; }' > ~/.claude/hooks/lib/resolve-account.sh" "$A"
+ok "sed -i the guard script -> DENY"           DENY Bash "sed -i 's/deny/echo/' ~/.claude/hooks/identity-guard.sh" "$A"
+ok "cat folders.json (read) -> ALLOW"          ALLOW Bash "cat ~/.config/identity-lock/folders.json" "$A"
+ok "grep guard script (read) -> ALLOW"         ALLOW Bash "grep -n deny ~/.claude/hooks/identity-guard.sh" "$A"
+ok "ls identity-lock dir (read) -> ALLOW"      ALLOW Bash "ls -la ~/.config/identity-lock/" "$A"
+
+# ---- L1: ROOT is regex-escaped in the -C in-tree exception (dotted lock path 'v1.2') ----
+ok "git -C sibling v1X2 (ROOT=v1.2) -> DENY" DENY Bash "git -C $ESIB/repo push origin main" "$E"
+ok "git -C in-tree v1.2 -> ALLOW"            ALLOW Bash "git -C $E/repo status" "$E"
+
+# ---- M6: gh auth setup-git always denied; switch/refresh fail-closed in an unpinned tree ----
+ok    "gh auth setup-git (root) -> DENY"        DENY Bash "gh auth setup-git" "$A"
+rawok "gh auth setup-git unpinned subdir -> DENY" DENY "gh auth setup-git" "$A/sub" "__unset__"
+rawok "gh auth switch unpinned subdir -> DENY"    DENY "gh auth switch -u account-b" "$A/sub" "__unset__"
+rawok "gh auth refresh unpinned subdir -> DENY"   DENY "gh auth refresh -s admin:org" "$A/sub" "__unset__"
+rawok "gh auth token unpinned subdir -> ALLOW"    ALLOW "gh auth token" "$A/sub" "__unset__"
 
 echo; echo "=== $pass passed, $fail failed ==="
 [ "$fail" -gt 0 ] && { printf '  - %s\n' "${F[@]}"; exit 1; } || exit 0
