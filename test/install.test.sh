@@ -146,6 +146,25 @@ grepf "(b) per-account gitconfig credential helper calls gh auth token --user ac
 countf "(b) credential helper appears exactly once (idempotent)" \
   "$GC" "gh auth token --user account-a" 1
 
+# (b2) --env-token-fallback (opt-in): the push helper falls back to the env GH_TOKEN when the
+#      keychain lookup is empty (lets headless/background sessions push). The DEFAULT (no flag,
+#      account-a above) must NOT carry the fallback — keychain-only stays the secure default.
+if grep -q 'GH_TOKEN' "$GC" 2>/dev/null; then
+  fail=$((fail+1)); printf '  FAIL  %s\n' "(b2) DEFAULT helper has NO env-token fallback"
+else
+  pass=$((pass+1)); printf '  PASS  %s\n' "(b2) DEFAULT helper has NO env-token fallback"
+fi
+EFH="$TMP/home-envfb"; mkdir -p "$EFH/repo-c"
+printf '%s\n' "$EFH/repo-c" "account-c" "Account C" "c@users.noreply.github.com" "" \
+  | HOME="$EFH" bash "$INSTALL" --non-interactive-from-stdin --env-token-fallback >/dev/null 2>&1
+GCFB="$EFH/.config/git/account-c.gitconfig"
+grepf "(b2) --env-token-fallback helper still pins gh auth token --user account-c" \
+  "$GCFB" "gh auth token --user account-c"
+grepf "(b2) --env-token-fallback helper falls back to the env GH_TOKEN" \
+  "$GCFB" 'GH_TOKEN'
+countf "(b2) fallback helper appears exactly once (idempotent)" \
+  "$GCFB" "gh auth token --user account-c" 1
+
 # (c) folder-a/.claude/settings.local.json: the Bash|mcp PreToolUse hook +
 #     env.GH_TOKEN==TOKEN_A (from the stubbed gh keyring).
 jqf "(c) settings.local.json has Bash|mcp PreToolUse matcher" \

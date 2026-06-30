@@ -29,14 +29,17 @@ GH_MCP_URL="https://api.githubcopilot.com/mcp/"
 SCRIPTED=0
 HARDEN=0   # --harden-keychain (or an interactive yes) forces osxkeychain hardening
 MCP_OVERRIDE=1   # default ON; --no-mcp-override (or an interactive no) skips the MCP override
+ENV_FALLBACK=0   # --env-token-fallback: push helper falls back to the env GH_TOKEN when the
+                 # keychain lookup is empty (lets headless/background sessions push). Off by default.
 for arg in "$@"; do
   case "$arg" in
     --non-interactive-from-stdin) SCRIPTED=1 ;;
     --harden-keychain)            HARDEN=1 ;;
     --no-mcp-override)            MCP_OVERRIDE=0 ;;
+    --env-token-fallback)         ENV_FALLBACK=1 ;;
     -h|--help)
       cat <<'USAGE'
-Usage: install.sh [--non-interactive-from-stdin] [--harden-keychain] [--no-mcp-override]
+Usage: install.sh [--non-interactive-from-stdin] [--harden-keychain] [--no-mcp-override] [--env-token-fallback]
 
 Locks one or more local folders each to a specific GitHub account by recording
 them in ~/.config/identity-lock/folders.json.
@@ -58,6 +61,17 @@ user-scoped `github` MCP server (same endpoint as the GitHub plugin) whose
 headersHelper resolves the locked account by cwd, so GitHub MCP works from
 sub-directory launches too. NOTE: enabling it changes the GitHub MCP tool
 namespace machine-wide (mcp__plugin_github_github__* -> mcp__github__*).
+
+--env-token-fallback: make the per-folder push credential helper fall back to
+the environment GH_TOKEN when `gh auth token --user <account>` returns nothing.
+The keychain lookup is empty in a headless / background process (e.g. an agent
+session) that cannot read the macOS login keychain; the env GH_TOKEN, which the
+per-folder settings.local.json (and the SessionStart pin) sets to the SAME
+locked account from a file the process CAN read, lets such sessions push. Off by
+default (keychain-only is the strongest source). Tradeoff: a file-stored token
+is easier to read than a keychain one — but it is already in settings.local.json,
+and the fallback only fires when the keychain source is unavailable. Still pinned
+to the locked account.
 USAGE
       exit 0 ;;
   esac
@@ -259,8 +273,19 @@ wire_folder() {
   # real helper. --replace-all collapses any prior duplicates so re-running yields
   # exactly ['', '<helper>'] every time (idempotent; defeats osxkeychain by order).
   git config -f "$gc" --replace-all 'credential.https://github.com.helper' '' 2>/dev/null
+  # The password is the locked account's token via `gh auth token --user <account>` (reads the
+  # macOS keychain). With --env-token-fallback, when that lookup is empty — e.g. a headless/
+  # background session that can't read the login keychain — fall back to the env GH_TOKEN, which the
+  # per-folder settings.local.json / SessionStart pin sets to the SAME locked account from a
+  # file the process CAN read. Default stays keychain-only (strongest).
+  local pw
+  if [ "$ENV_FALLBACK" = 1 ]; then
+    pw="\$(gh auth token --user $account 2>/dev/null || printf '%s' \"\$GH_TOKEN\")"
+  else
+    pw="\$(gh auth token --user $account)"
+  fi
   git config -f "$gc" --add 'credential.https://github.com.helper' \
-    "!f() { test \"\$1\" = get && echo username=x-access-token && echo \"password=\$(gh auth token --user $account)\"; }; f"
+    "!f() { test \"\$1\" = get && echo username=x-access-token && echo \"password=$pw\"; }; f"
 
   # --- L1: ~/.gitconfig includeIf -> the per-account gitconfig (idempotent) -----
   local gitconfig="$HOME/.gitconfig"
