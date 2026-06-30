@@ -118,6 +118,28 @@ keychain entry so that a push outside a locked folder has **no** ambient
 credential to fall back on — it fails closed instead of silently using whatever
 the keychain holds. This is opt-in and off by default.
 
+### Optional: pushing from headless / agent sessions (`--env-token-fallback`)
+
+The push credential helper resolves the token with `gh auth token --user <account>`,
+which reads the **macOS login keychain**. A **headless or background process** —
+notably an automated agent session — cannot read the login keychain, so that lookup
+comes back empty and pushes fail (commits still work; they need no token). Install
+with `--env-token-fallback` to have the helper fall back to the environment
+`GH_TOKEN` when the keychain lookup is empty:
+
+```sh
+./install.sh --env-token-fallback
+```
+
+`GH_TOKEN` is set by the per-folder `settings.local.json` (and the SessionStart pin)
+to the **same locked account**, from a file the background process *can* read — so
+those sessions can push, still pinned to the locked account. The keychain remains
+the preferred source; the env token is used only when it is unavailable. Run the
+install **from a normal terminal** (where the keychain is readable) so a valid token
+is captured into `settings.local.json`. **Tradeoff:** a file-stored token is easier
+to read than a keychain one — but it already lives in `settings.local.json`, and the
+fallback fires only when the stronger source can't be reached. Opt-in, off by default.
+
 ## How the deny-guard works
 
 `identity-guard.sh` is a Claude Code **PreToolUse** hook. For each tool call it:
